@@ -65,6 +65,12 @@ export async function readMessage(gmail, id) {
     (message.payload?.headers || []).map((h) => [h.name.toLowerCase(), h.value])
   );
 
+  const attachmentRefs = collectAttachmentRefs(message.payload);
+  const attachments = [];
+  for (const ref of attachmentRefs) {
+    attachments.push(await fetchAttachment(gmail, message.id, ref));
+  }
+
   return {
     id: message.id,
     threadId: message.threadId,
@@ -75,7 +81,56 @@ export async function readMessage(gmail, id) {
     date: headers.date || "",
     receivedAt: message.internalDate ? new Date(Number(message.internalDate)).toISOString() : null,
     snippet: message.snippet || "",
-    bodyText: extractText(message.payload)
+    bodyText: extractText(message.payload),
+    attachments
+  };
+}
+
+function collectAttachmentRefs(payload) {
+  const refs = [];
+  walkAttachmentParts(payload, refs);
+  return refs;
+}
+
+function walkAttachmentParts(part, refs) {
+  if (!part) return;
+  if (part.filename && part.body?.attachmentId) {
+    refs.push({
+      attachmentId: part.body.attachmentId,
+      filename: part.filename,
+      mimeType: part.mimeType || "application/octet-stream",
+      size: part.body.size || null
+    });
+  }
+  if (part.filename && part.body?.data) {
+    refs.push({
+      data: part.body.data,
+      filename: part.filename,
+      mimeType: part.mimeType || "application/octet-stream",
+      size: part.body.size || null
+    });
+  }
+  for (const child of part.parts || []) walkAttachmentParts(child, refs);
+}
+
+async function fetchAttachment(gmail, messageId, ref) {
+  let data = ref.data;
+  if (!data && ref.attachmentId) {
+    const result = await gmail.users.messages.attachments.get({
+      userId: "me",
+      messageId,
+      id: ref.attachmentId
+    });
+    data = result.data.data;
+  }
+
+  const buffer = Buffer.from(data || "", "base64url");
+  return {
+    filename: ref.filename,
+    mimeType: ref.mimeType,
+    size: ref.size || buffer.length,
+    attachmentId: ref.attachmentId || null,
+    content: buffer
   };
 }
 

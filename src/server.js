@@ -44,7 +44,7 @@ app.get("/", async (_req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  const [deadlines, needsReview, events, cases, runs, stats] = await Promise.all([
+  const [deadlines, needsReview, events, cases, documents, runs, stats] = await Promise.all([
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
@@ -83,9 +83,18 @@ app.get("/", async (_req, res) => {
       from cases c
       left join deadlines d on d.case_id = c.id
       left join docket_events de on de.case_id = c.id
+      left join documents doc on doc.case_id = c.id
       group by c.id
       order by next_deadline_at nulls last, latest_activity_at desc nulls last
       limit 30
+    `),
+    pool.query(`
+      select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
+             doc.extracted_text, doc.created_at, e.subject, e.received_at
+      from documents doc
+      join emails e on e.gmail_id = doc.gmail_id
+      order by doc.created_at desc
+      limit 200
     `),
     pool.query("select * from sync_runs order by started_at desc limit 5"),
     pool.query(`
@@ -93,7 +102,8 @@ app.get("/", async (_req, res) => {
         (select count(*) from deadlines where status = 'open') as open_deadlines,
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
         (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
-        (select count(*) from docket_events where status = 'open') as open_events
+        (select count(*) from docket_events where status = 'open') as open_events,
+        (select count(*) from documents) as documents
     `)
   ]);
 
@@ -103,6 +113,7 @@ app.get("/", async (_req, res) => {
     needsReview: needsReview.rows,
     events: events.rows,
     cases: cases.rows,
+    documents: documents.rows,
     runs: runs.rows,
     stats: stats.rows[0]
   })));
@@ -146,6 +157,16 @@ app.post("/deadlines/:id/archive", async (req, res) => {
 app.post("/events/:id/archive", async (req, res) => {
   await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
+});
+
+app.get("/documents/:id/download", async (req, res) => {
+  const result = await pool.query("select filename, mime_type, content from documents where id = $1", [req.params.id]);
+  const doc = result.rows[0];
+  if (!doc || !doc.content) return res.status(404).send("Document not found.");
+
+  res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
+  res.setHeader("Content-Disposition", `attachment; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
+  res.send(doc.content);
 });
 
 app.post("/api/chat", async (req, res) => {
@@ -244,7 +265,14 @@ function layout(title, body) {
     .activity-title { font-weight: 800; margin-bottom: 4px; }
     .small-list { display: grid; gap: 10px; }
     .case-card { border: 1px solid #e4e7ec; border-radius: 8px; padding: 12px; background: #fff; }
+    details.case-card summary { cursor: pointer; list-style: none; }
+    details.case-card summary::-webkit-details-marker { display: none; }
     .case-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .document-list { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
+    .document-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #fbfcfe; }
+    .document-name { font-weight: 800; overflow-wrap: anywhere; }
+    .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
+    .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
     .chat-box { display: grid; gap: 10px; }
     .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
     .chat-input { box-sizing: border-box; width: 100%; min-height: 82px; resize: vertical; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; font-size: 13px; }
@@ -292,7 +320,7 @@ function loginHtml(hasError) {
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, stats }) {
+function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, runs, stats }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
@@ -337,9 +365,9 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Active Cases</h2><div class="muted">Each case shows the next known deadline and open work</div></div>
+            <div><h2>Active Cases & Documents</h2><div class="muted">Open a case to see downloaded documents</div></div>
           </div>
-          <div class="panel-body">${caseCards(cases)}</div>
+          <div class="panel-body">${caseCards(cases, documents)}</div>
         </section>
         <section class="panel">
           <div class="panel-head">
@@ -355,12 +383,13 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
         <details class="panel">
           <summary class="panel-head"><h2>Sync History</h2><span class="muted">Open</span></summary>
           ${table(
-            ["Started", "Scanned", "Notices", "Deadlines", "Summary"],
+            ["Started", "Scanned", "Notices", "Deadlines", "Docs", "Summary"],
             runs.map((r) => [
               formatDate(r.started_at),
               String(r.scanned_count),
               String(r.notice_count),
               String(r.deadline_count),
+              String(r.document_count || 0),
               escapeHtml(r.error || r.summary || "")
             ])
           )}
@@ -407,10 +436,20 @@ async function loadAttorneyContext() {
     `)
   ]);
 
+  const documents = await pool.query(`
+    select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
+           left(doc.extracted_text, 2500) as extracted_text, c.case_name, c.court, c.case_number
+    from documents doc
+    join cases c on c.id = doc.case_id
+    order by doc.created_at desc
+    limit 100
+  `);
+
   return {
     openDeadlines: deadlines.rows,
     activeCases: cases.rows,
-    recentCourtActivity: events.rows
+    recentCourtActivity: events.rows,
+    documents: documents.rows
   };
 }
 
@@ -446,6 +485,10 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
 
   if (latestEvent) {
     items.push(`Latest court activity: ${escapeHtml(latestEvent.event_title || latestEvent.subject || "Court notice")} received ${formatDate(latestEvent.source_received_at)}.`);
+  }
+
+  if (Number(stats.documents || 0) > 0) {
+    items.push(`${Number(stats.documents)} document(s) have been downloaded and grouped under their cases.`);
   }
 
   return `<ul class="summary-list">${items.map((item) => `<li>${item}</li>`).join("")}</ul>`;
@@ -535,19 +578,44 @@ function activityList(events) {
     </div>`).join("")}</div>`;
 }
 
-function caseCards(cases) {
+function caseCards(cases, documents) {
   if (!cases.length) return `<div class="empty">No cases found yet. Run a sync after connecting Gmail.</div>`;
+  const docsByCase = new Map();
+  for (const doc of documents || []) {
+    const list = docsByCase.get(doc.case_id) || [];
+    list.push(doc);
+    docsByCase.set(doc.case_id, list);
+  }
+
   return `<div class="small-list">${cases.map((c) => `
-    <div class="case-card">
-      <div class="case-title">${escapeHtml(c.case_name || "Unknown case")}</div>
-      <div class="muted">${escapeHtml([c.court, c.case_number].filter(Boolean).join(" | ") || "Court/case number pending")}</div>
-      <div class="case-meta">
-        ${c.next_deadline_at ? `<span class="tag">Next: ${formatDate(c.next_deadline_at)}</span>` : `<span class="tag review">No parsed deadline</span>`}
-        <span class="tag">${Number(c.open_deadline_count || 0)} deadlines</span>
-        <span class="tag">${Number(c.open_event_count || 0)} activity</span>
-      </div>
+    <details class="case-card">
+      <summary>
+        <div class="case-title">${escapeHtml(c.case_name || "Unknown case")}</div>
+        <div class="muted">${escapeHtml([c.court, c.case_number].filter(Boolean).join(" | ") || "Court/case number pending")}</div>
+        <div class="case-meta">
+          ${c.next_deadline_at ? `<span class="tag">Next: ${formatDate(c.next_deadline_at)}</span>` : `<span class="tag review">No parsed deadline</span>`}
+          <span class="tag">${Number(c.open_deadline_count || 0)} deadlines</span>
+          <span class="tag">${Number(c.open_event_count || 0)} activity</span>
+          <span class="tag">${(docsByCase.get(c.id) || []).length} docs</span>
+        </div>
+      </summary>
       ${c.judge ? `<div class="muted" style="margin-top:8px">Judge: ${escapeHtml(c.judge)}</div>` : ""}
       ${c.latest_activity_at ? `<div class="muted" style="margin-top:4px">Latest activity: ${formatDate(c.latest_activity_at)}</div>` : ""}
+      ${documentList(docsByCase.get(c.id) || [])}
+    </details>
+  `).join("")}</div>`;
+}
+
+function documentList(documents) {
+  if (!documents.length) return `<div class="document-list"><div class="muted">No downloaded documents for this case yet.</div></div>`;
+  return `<div class="document-list">${documents.map((doc) => `
+    <div class="document-row">
+      <div>
+        <div class="document-name">${escapeHtml(doc.filename)}</div>
+        <div class="muted">${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
+        ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
+      </div>
+      <a class="document-link" href="/documents/${doc.id}/download">Download</a>
     </div>
   `).join("")}</div>`;
 }
@@ -580,6 +648,14 @@ function formatDate(value) {
     dateStyle: "medium",
     timeStyle: "short"
   }).format(new Date(value));
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "unknown size";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function escapeHtml(value) {

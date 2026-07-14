@@ -74,6 +74,21 @@ export async function initDb() {
       created_at timestamptz not null default now()
     );
 
+    create table if not exists documents (
+      id serial primary key,
+      case_id integer references cases(id) on delete cascade,
+      gmail_id text references emails(gmail_id) on delete cascade,
+      filename text not null,
+      mime_type text,
+      size_bytes integer,
+      source_attachment_id text,
+      content bytea,
+      extracted_text text,
+      read_status text not null default 'pending',
+      created_at timestamptz not null default now(),
+      unique (gmail_id, filename, size_bytes)
+    );
+
     create table if not exists sync_runs (
       id serial primary key,
       started_at timestamptz not null default now(),
@@ -82,6 +97,7 @@ export async function initDb() {
       scanned_count integer not null default 0,
       notice_count integer not null default 0,
       deadline_count integer not null default 0,
+      document_count integer not null default 0,
       summary text,
       error text
     );
@@ -91,8 +107,12 @@ export async function initDb() {
     alter table docket_events add column if not exists status text not null default 'open';
     alter table docket_events add column if not exists archived_at timestamptz;
     alter table deadlines add column if not exists archived_at timestamptz;
+    alter table documents add column if not exists extracted_text text;
+    alter table documents add column if not exists read_status text not null default 'pending';
+    alter table sync_runs add column if not exists document_count integer not null default 0;
     create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at);
     create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc);
+    create index if not exists documents_case_id_idx on documents (case_id, created_at desc);
   `);
 }
 
