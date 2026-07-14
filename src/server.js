@@ -208,12 +208,21 @@ function layout(title, body) {
     .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
     .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-height: 74px; }
     .metric strong { display: block; font-size: 26px; line-height: 1; margin-top: 8px; }
-    .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, .9fr); gap: 16px; align-items: start; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
     .stack { display: grid; gap: 16px; }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
     .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .panel-body { padding: 10px 14px; }
     .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
+    .snapshot { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr); gap: 14px; margin-bottom: 16px; }
+    .summary-list { margin: 0; padding-left: 20px; display: grid; gap: 8px; }
+    .summary-list li { line-height: 1.35; }
+    .simple-counts { display: grid; gap: 8px; }
+    .simple-count { border: 1px solid #e4e7ec; border-radius: 8px; padding: 10px 12px; background: #fff; display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .simple-count strong { font-size: 20px; }
+    details.panel summary { list-style: none; cursor: pointer; }
+    details.panel summary::-webkit-details-marker { display: none; }
+    .section-note { padding: 10px 14px; border-bottom: 1px solid #edf0f5; color: var(--muted); font-size: 13px; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid #edf0f5; vertical-align: top; font-size: 13px; }
     th { background: #f8fafc; color: #475467; font-weight: 800; }
@@ -243,7 +252,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>
@@ -284,6 +293,7 @@ function loginHtml(hasError) {
 }
 
 function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, stats }) {
+  const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
       <div>
@@ -292,49 +302,58 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
       </div>
       <form method="post" action="/sync-now"><button type="submit">Sync Now</button></form>
     </div>
-    <div class="summary">
-      ${metric("Open Deadlines", stats.open_deadlines)}
-      ${metric("Due In 7 Days", stats.due_soon)}
-      ${metric("Needs Review", stats.needs_review)}
-      ${metric("Open Court Activity", stats.open_events)}
+    <div class="snapshot">
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>Today's Summary</h2><div class="muted">${escapeHtml(runSummary)}</div></div>
+        </div>
+        <div class="panel-body">
+          ${summaryList({ deadlines, needsReview, events, cases, stats })}
+        </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>At A Glance</h2></div>
+        <div class="panel-body simple-counts">
+          ${simpleCount("Due in 7 days", stats.due_soon)}
+          ${simpleCount("Need review", stats.needs_review)}
+          ${simpleCount("Open deadlines", stats.open_deadlines)}
+        </div>
+      </section>
     </div>
     <div class="notice">Deadlines are extracted from email notices and must be verified against the docket and applicable rules before anyone relies on them.</div>
     <div class="layout">
       <div class="stack">
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Attorney Review Queue</h2><div class="muted">Items with uncertain dates or missing date fields</div></div>
+            <div><h2>What Needs Attention</h2><div class="muted">Review these first, then check them off when handled</div></div>
           </div>
-          ${deadlineTable(needsReview, true)}
+          ${deadlineTable(needsReview.length ? needsReview : deadlines.slice(0, 10), Boolean(needsReview.length))}
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Upcoming Deadlines</h2><div class="muted">Sorted by next known due date</div></div>
+            <div><h2>Upcoming Deadlines</h2><div class="muted">Simple date-ordered list</div></div>
           </div>
           ${deadlineTable(deadlines, false)}
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Recent Court Activity</h2><div class="muted">Check an item when it has been reviewed and handled</div></div>
-          </div>
-          ${activityList(events)}
-        </section>
-      </div>
-      <div class="stack">
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>Ask AI</h2><div class="muted">Ask about upcoming deadlines, cases, and recent activity</div></div>
-          </div>
-          <div class="panel-body">${chatPanel()}</div>
-        </section>
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>Active Cases</h2><div class="muted">Upcoming case details from notices</div></div>
+            <div><h2>Active Cases</h2><div class="muted">Each case shows the next known deadline and open work</div></div>
           </div>
           <div class="panel-body">${caseCards(cases)}</div>
         </section>
         <section class="panel">
-          <div class="panel-head"><h2>Sync History</h2></div>
+          <div class="panel-head">
+            <div><h2>Ask AI</h2><div class="muted">Ask plain-English questions about upcoming work</div></div>
+          </div>
+          <div class="panel-body">${chatPanel()}</div>
+        </section>
+        <details class="panel">
+          <summary class="panel-head"><h2>Recent Court Activity</h2><span class="muted">Open</span></summary>
+          <div class="section-note">Check an item when it has been reviewed and handled.</div>
+          ${activityList(events)}
+        </details>
+        <details class="panel">
+          <summary class="panel-head"><h2>Sync History</h2><span class="muted">Open</span></summary>
           ${table(
             ["Started", "Scanned", "Notices", "Deadlines", "Summary"],
             runs.map((r) => [
@@ -345,7 +364,7 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
               escapeHtml(r.error || r.summary || "")
             ])
           )}
-        </section>
+        </details>
       </div>
     </div>
   `;
@@ -397,6 +416,39 @@ async function loadAttorneyContext() {
 
 function metric(label, value) {
   return `<div class="metric"><div class="eyebrow">${escapeHtml(label)}</div><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function simpleCount(label, value) {
+  return `<div class="simple-count"><span>${escapeHtml(label)}</span><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function summaryList({ deadlines, needsReview, events, cases, stats }) {
+  const nextDeadline = deadlines.find((d) => d.due_at) || deadlines[0];
+  const nextCase = cases.find((c) => c.next_deadline_at) || cases[0];
+  const latestEvent = events[0];
+  const items = [];
+
+  if (Number(stats.needs_review || 0) > 0) {
+    items.push(`${Number(stats.needs_review)} item(s) need attorney review because the date is uncertain or missing.`);
+  } else {
+    items.push("No extracted deadlines are currently flagged for attorney review.");
+  }
+
+  if (nextDeadline) {
+    items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Unknown case")} - ${escapeHtml(nextDeadline.label)}.`);
+  } else {
+    items.push("No open deadlines have been extracted yet.");
+  }
+
+  if (nextCase) {
+    items.push(`Next active case to watch: ${escapeHtml(nextCase.case_name || "Unknown case")} ${nextCase.next_deadline_at ? `on ${formatDate(nextCase.next_deadline_at)}` : "with no parsed deadline yet"}.`);
+  }
+
+  if (latestEvent) {
+    items.push(`Latest court activity: ${escapeHtml(latestEvent.event_title || latestEvent.subject || "Court notice")} received ${formatDate(latestEvent.source_received_at)}.`);
+  }
+
+  return `<ul class="summary-list">${items.map((item) => `<li>${item}</li>`).join("")}</ul>`;
 }
 
 function chatPanel() {
