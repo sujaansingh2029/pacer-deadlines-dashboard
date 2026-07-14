@@ -54,6 +54,8 @@ export async function initDb() {
       filed_at timestamptz,
       source_received_at timestamptz,
       summary text,
+      status text not null default 'open',
+      archived_at timestamptz,
       raw jsonb not null default '{}'::jsonb,
       created_at timestamptz not null default now()
     );
@@ -68,6 +70,7 @@ export async function initDb() {
       confidence text not null default 'needs_review',
       source_quote text,
       status text not null default 'open',
+      archived_at timestamptz,
       created_at timestamptz not null default now()
     );
 
@@ -82,6 +85,14 @@ export async function initDb() {
       summary text,
       error text
     );
+  `);
+
+  await pool.query(`
+    alter table docket_events add column if not exists status text not null default 'open';
+    alter table docket_events add column if not exists archived_at timestamptz;
+    alter table deadlines add column if not exists archived_at timestamptz;
+    create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at);
+    create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc);
   `);
 }
 

@@ -43,7 +43,7 @@ app.get("/", async (_req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  const [deadlines, events, runs] = await Promise.all([
+  const [deadlines, needsReview, events, cases, runs, stats] = await Promise.all([
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
@@ -54,17 +54,57 @@ app.get("/", async (_req, res) => {
       limit 50
     `),
     pool.query(`
+      select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
+      from deadlines d
+      join cases c on c.id = d.case_id
+      join emails e on e.gmail_id = d.gmail_id
+      where d.status = 'open'
+        and (d.confidence = 'needs_review' or d.due_at is null)
+      order by d.created_at desc
+      limit 25
+    `),
+    pool.query(`
       select de.*, c.case_name, c.court, c.case_number, e.subject
       from docket_events de
       join cases c on c.id = de.case_id
       join emails e on e.gmail_id = de.gmail_id
+      where de.status = 'open'
       order by de.source_received_at desc nulls last, de.created_at desc
       limit 50
     `),
-    pool.query("select * from sync_runs order by started_at desc limit 5")
+    pool.query(`
+      select
+        c.*,
+        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
+        count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
+        count(distinct de.id) filter (where de.status = 'open') as open_event_count,
+        max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at
+      from cases c
+      left join deadlines d on d.case_id = c.id
+      left join docket_events de on de.case_id = c.id
+      group by c.id
+      order by next_deadline_at nulls last, latest_activity_at desc nulls last
+      limit 30
+    `),
+    pool.query("select * from sync_runs order by started_at desc limit 5"),
+    pool.query(`
+      select
+        (select count(*) from deadlines where status = 'open') as open_deadlines,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
+        (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
+        (select count(*) from docket_events where status = 'open') as open_events
+    `)
   ]);
 
-  res.send(layout("PACER Deadlines Dashboard", dashboardHtml({ mailbox, deadlines: deadlines.rows, events: events.rows, runs: runs.rows })));
+  res.send(layout("PACER Deadlines Dashboard", dashboardHtml({
+    mailbox,
+    deadlines: deadlines.rows,
+    needsReview: needsReview.rows,
+    events: events.rows,
+    cases: cases.rows,
+    runs: runs.rows,
+    stats: stats.rows[0]
+  })));
 });
 
 app.get("/auth/google", (_req, res) => {
@@ -97,6 +137,16 @@ app.post("/sync-now", async (_req, res) => {
   res.redirect("/");
 });
 
+app.post("/deadlines/:id/archive", async (req, res) => {
+  await pool.query("update deadlines set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
+  res.redirect(req.get("referer") || "/");
+});
+
+app.post("/events/:id/archive", async (req, res) => {
+  await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
+  res.redirect(req.get("referer") || "/");
+});
+
 if (config.databaseUrl) await initDb();
 app.listen(config.port, () => {
   console.log(`PACER dashboard listening on ${config.port}`);
@@ -110,30 +160,55 @@ function layout(title, body) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)}</title>
   <style>
-    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #f7f8fb; color: #172033; }
-    header { background: #ffffff; border-bottom: 1px solid #dfe4ee; padding: 20px 28px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-    main { max-width: 1180px; margin: 0 auto; padding: 24px; }
-    h1 { font-size: 24px; margin: 0; letter-spacing: 0; }
-    h2 { font-size: 16px; margin: 24px 0 12px; }
-    .muted { color: #667085; font-size: 14px; }
-    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-    .panel { background: #fff; border: 1px solid #dfe4ee; border-radius: 8px; padding: 16px; }
-    table { width: 100%; border-collapse: collapse; background: #fff; border: 1px solid #dfe4ee; border-radius: 8px; overflow: hidden; }
-    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #edf0f6; vertical-align: top; font-size: 14px; }
-    th { background: #f0f3f8; color: #344054; font-weight: 700; }
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; --ink:#111827; --muted:#667085; --line:#d9e0ea; --soft:#f6f8fb; --panel:#ffffff; --blue:#175cd3; --green:#067647; --amber:#b54708; --red:#b42318; }
+    body { margin: 0; background: var(--soft); color: var(--ink); }
+    header { background: #ffffff; border-bottom: 1px solid var(--line); padding: 18px 28px; display: flex; align-items: center; justify-content: space-between; gap: 16px; position: sticky; top: 0; z-index: 2; }
+    main { max-width: 1360px; margin: 0 auto; padding: 22px; }
+    h1 { font-size: 22px; margin: 0; letter-spacing: 0; }
+    h2 { font-size: 15px; margin: 0; letter-spacing: 0; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .eyebrow { color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
+    .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-height: 74px; }
+    .metric strong { display: block; font-size: 26px; line-height: 1; margin-top: 8px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(320px, .9fr); gap: 16px; align-items: start; }
+    .stack { display: grid; gap: 16px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .panel-body { padding: 10px 14px; }
+    .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid #edf0f5; vertical-align: top; font-size: 13px; }
+    th { background: #f8fafc; color: #475467; font-weight: 800; }
     tr:last-child td { border-bottom: 0; }
-    a.button, button { background: #155eef; color: white; border: 0; border-radius: 6px; padding: 10px 14px; text-decoration: none; font-weight: 700; cursor: pointer; }
-    .warning { border-left: 4px solid #b54708; background: #fff7ed; padding: 12px 14px; border-radius: 6px; }
-    .tag { display: inline-block; background: #e7f0ff; color: #1849a9; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; }
-    @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+    a.button, button { background: var(--blue); color: white; border: 0; border-radius: 6px; padding: 9px 12px; text-decoration: none; font-weight: 800; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #ffffff; color: var(--blue); border: 1px solid #b8c7e6; }
+    .tag { display: inline-block; background: #e7f0ff; color: #1849a9; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 800; white-space: nowrap; }
+    .tag.review { background:#fff1d6; color:#93370d; }
+    .tag.high { background:#dcfae6; color:#05603a; }
+    .case-title { font-weight: 800; }
+    .due { font-weight: 800; white-space: nowrap; }
+    .empty { padding: 18px; color: var(--muted); }
+    .check-form { margin: 0; }
+    .check-button { width: 26px; height: 26px; border-radius: 6px; background: #fff; border: 1px solid #98a2b3; color: transparent; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+    .check-button:hover { background: #ecfdf3; border-color: var(--green); color: var(--green); }
+    .check-button::after { content: "✓"; font-weight: 900; font-size: 16px; }
+    .activity-card { display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 8px; padding: 12px 0; border-bottom: 1px solid #edf0f5; }
+    .activity-card:last-child { border-bottom: 0; }
+    .activity-title { font-weight: 800; margin-bottom: 4px; }
+    .small-list { display: grid; gap: 10px; }
+    .case-card { border: 1px solid #e4e7ec; border-radius: 8px; padding: 12px; background: #fff; }
+    .case-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
+    @media (max-width: 980px) { .layout, .summary { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>${escapeHtml(title)}</h1>
-      <div class="muted">Court notice monitoring for active cases</div>
+      <div class="muted">Court notice monitoring, active-case deadlines, and attorney review queue</div>
     </div>
   </header>
   <main>${body}</main>
@@ -142,7 +217,7 @@ function layout(title, body) {
 }
 
 function setupHtml(missing) {
-  return `<div class="warning">Missing required environment variables: ${missing.map(escapeHtml).join(", ")}.</div>`;
+  return `<div class="notice">Missing required environment variables: ${missing.map(escapeHtml).join(", ")}.</div>`;
 }
 
 function connectHtml() {
@@ -155,58 +230,137 @@ function connectHtml() {
 
 function loginHtml(hasError) {
   return `<div class="panel" style="max-width:420px">
-    <h2>Sign in</h2>
-    ${hasError ? `<div class="warning">Wrong password.</div>` : ""}
+    <div class="panel-head"><h2>Sign in</h2></div>
+    <div class="panel-body">
+    ${hasError ? `<div class="notice">Wrong password.</div>` : ""}
     <form method="post" action="/login">
-      <p><input name="password" type="password" placeholder="Dashboard password" style="box-sizing:border-box;width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:6px"></p>
+      <p><input name="password" type="password" placeholder="Dashboard password"></p>
       <button type="submit">Open Dashboard</button>
     </form>
+    </div>
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, events, runs }) {
+function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, stats }) {
   return `
-    <div class="grid">
-      <div class="panel"><strong>Mailbox</strong><br><span class="muted">${escapeHtml(mailbox.email)}</span></div>
-      <div class="panel"><strong>Last Sync</strong><br><span class="muted">${formatDate(mailbox.last_sync_at) || "Not synced yet"}</span></div>
-      <div class="panel">
-        <form method="post" action="/sync-now"><button type="submit">Sync Now</button></form>
+    <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
+      <div>
+        <div class="eyebrow">Mailbox</div>
+        <div>${escapeHtml(mailbox.email)} <span class="muted">Last sync: ${formatDate(mailbox.last_sync_at) || "Not synced yet"}</span></div>
+      </div>
+      <form method="post" action="/sync-now"><button type="submit">Sync Now</button></form>
+    </div>
+    <div class="summary">
+      ${metric("Open Deadlines", stats.open_deadlines)}
+      ${metric("Due In 7 Days", stats.due_soon)}
+      ${metric("Needs Review", stats.needs_review)}
+      ${metric("Open Court Activity", stats.open_events)}
+    </div>
+    <div class="notice">Deadlines are extracted from email notices and must be verified against the docket and applicable rules before anyone relies on them.</div>
+    <div class="layout">
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Attorney Review Queue</h2><div class="muted">Items with uncertain dates or missing date fields</div></div>
+          </div>
+          ${deadlineTable(needsReview, true)}
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Upcoming Deadlines</h2><div class="muted">Sorted by next known due date</div></div>
+          </div>
+          ${deadlineTable(deadlines, false)}
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Recent Court Activity</h2><div class="muted">Check an item when it has been reviewed and handled</div></div>
+          </div>
+          ${activityList(events)}
+        </section>
+      </div>
+      <div class="stack">
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Active Cases</h2><div class="muted">Upcoming case details from notices</div></div>
+          </div>
+          <div class="panel-body">${caseCards(cases)}</div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><h2>Sync History</h2></div>
+          ${table(
+            ["Started", "Scanned", "Notices", "Deadlines", "Summary"],
+            runs.map((r) => [
+              formatDate(r.started_at),
+              String(r.scanned_count),
+              String(r.notice_count),
+              String(r.deadline_count),
+              escapeHtml(r.error || r.summary || "")
+            ])
+          )}
+        </section>
       </div>
     </div>
-    <div class="warning" style="margin-top:16px">Deadlines are extracted from email notices and must be verified against the docket and applicable rules.</div>
-    <h2>Next Deadlines</h2>
-    ${table(
-      ["Due", "Case", "Deadline", "Confidence", "Source"],
-      deadlines.map((d) => [
-        formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review"),
-        caseLabel(d),
-        escapeHtml(d.label),
-        `<span class="tag">${escapeHtml(d.confidence)}</span>`,
-        escapeHtml(d.subject || "")
-      ])
-    )}
-    <h2>Recent Docket Activity</h2>
-    ${table(
-      ["Received", "Case", "Event", "Summary"],
-      events.map((e) => [
-        formatDate(e.source_received_at),
-        caseLabel(e),
-        escapeHtml(e.event_title || e.subject || "Court notice"),
-        escapeHtml(e.summary || "")
-      ])
-    )}
-    <h2>Recent Sync Runs</h2>
-    ${table(
-      ["Started", "Scanned", "Notices", "Deadlines", "Summary"],
-      runs.map((r) => [
-        formatDate(r.started_at),
-        String(r.scanned_count),
-        String(r.notice_count),
-        String(r.deadline_count),
-        escapeHtml(r.error || r.summary || "")
-      ])
-    )}
   `;
+}
+
+function metric(label, value) {
+  return `<div class="metric"><div class="eyebrow">${escapeHtml(label)}</div><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function deadlineTable(deadlines, compact) {
+  if (!deadlines.length) return `<div class="empty">No open items here.</div>`;
+  return table(
+    ["Done", "Due", "Case", "Deadline", "Confidence", compact ? "Why review" : "Source"],
+    deadlines.map((d) => [
+      archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline"),
+      `<span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review")}</span>`,
+      caseLabel(d),
+      `<strong>${escapeHtml(d.label)}</strong>${d.source_quote ? `<br><span class="muted">${escapeHtml(d.source_quote)}</span>` : ""}`,
+      confidenceTag(d.confidence),
+      escapeHtml(compact ? (d.due_at ? "Low confidence" : "Missing parsed date") : (d.subject || ""))
+    ])
+  );
+}
+
+function activityList(events) {
+  if (!events.length) return `<div class="empty">No open court activity.</div>`;
+  return `<div class="panel-body">${events.map((e) => `
+    <div class="activity-card">
+      <div>${archiveButton(`/events/${e.id}/archive`, "Archive activity")}</div>
+      <div>
+        <div class="activity-title">${escapeHtml(e.event_title || e.subject || "Court notice")}</div>
+        <div>${caseLabel(e)}</div>
+        <div class="muted">${formatDate(e.source_received_at)}${e.docket_number ? ` · Docket ${escapeHtml(e.docket_number)}` : ""}${e.filing_party ? ` · Filed by ${escapeHtml(e.filing_party)}` : ""}</div>
+        ${e.summary ? `<div style="margin-top:6px">${escapeHtml(e.summary)}</div>` : ""}
+      </div>
+    </div>`).join("")}</div>`;
+}
+
+function caseCards(cases) {
+  if (!cases.length) return `<div class="empty">No cases found yet. Run a sync after connecting Gmail.</div>`;
+  return `<div class="small-list">${cases.map((c) => `
+    <div class="case-card">
+      <div class="case-title">${escapeHtml(c.case_name || "Unknown case")}</div>
+      <div class="muted">${escapeHtml([c.court, c.case_number].filter(Boolean).join(" | ") || "Court/case number pending")}</div>
+      <div class="case-meta">
+        ${c.next_deadline_at ? `<span class="tag">Next: ${formatDate(c.next_deadline_at)}</span>` : `<span class="tag review">No parsed deadline</span>`}
+        <span class="tag">${Number(c.open_deadline_count || 0)} deadlines</span>
+        <span class="tag">${Number(c.open_event_count || 0)} activity</span>
+      </div>
+      ${c.judge ? `<div class="muted" style="margin-top:8px">Judge: ${escapeHtml(c.judge)}</div>` : ""}
+      ${c.latest_activity_at ? `<div class="muted" style="margin-top:4px">Latest activity: ${formatDate(c.latest_activity_at)}</div>` : ""}
+    </div>
+  `).join("")}</div>`;
+}
+
+function archiveButton(action, label) {
+  return `<form class="check-form" method="post" action="${escapeHtml(action)}"><button class="check-button" type="submit" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"></button></form>`;
+}
+
+function confidenceTag(confidence) {
+  const value = confidence || "needs_review";
+  const cls = value === "needs_review" ? " review" : value === "high" ? " high" : "";
+  return `<span class="tag${cls}">${escapeHtml(value.replaceAll("_", " "))}</span>`;
 }
 
 function table(headers, rows) {
