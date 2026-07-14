@@ -1,6 +1,7 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
+import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
 import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { authUrl, exchangeCode } from "./gmail.js";
@@ -147,6 +148,41 @@ app.post("/events/:id/archive", async (req, res) => {
   res.redirect(req.get("referer") || "/");
 });
 
+app.post("/api/chat", async (req, res) => {
+  const question = String(req.body?.question || "").trim();
+  if (!question) return res.status(400).json({ error: "Ask a question first." });
+  if (!config.openaiApiKey) return res.status(400).json({ error: "OPENAI_API_KEY is not configured." });
+
+  try {
+    const context = await loadAttorneyContext();
+    const client = new OpenAI({ apiKey: config.openaiApiKey });
+    const response = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an assistant for a law office dashboard. Answer only from the provided dashboard data. Be concise, practical, and organized. Always say that extracted court deadlines should be verified against the docket and applicable rules. Do not provide legal advice or invent missing facts."
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            today: new Date().toISOString(),
+            timezone: "America/New_York",
+            dashboardData: context,
+            question
+          })
+        }
+      ]
+    });
+    res.json({ answer: response.choices[0].message.content });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "The AI chat could not answer right now." });
+  }
+});
+
 if (config.databaseUrl) await initDb();
 app.listen(config.port, () => {
   console.log(`PACER dashboard listening on ${config.port}`);
@@ -200,6 +236,12 @@ function layout(title, body) {
     .small-list { display: grid; gap: 10px; }
     .case-card { border: 1px solid #e4e7ec; border-radius: 8px; padding: 12px; background: #fff; }
     .case-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+    .chat-box { display: grid; gap: 10px; }
+    .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
+    .chat-input { box-sizing: border-box; width: 100%; min-height: 82px; resize: vertical; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; font-size: 13px; }
+    .quick-prompts { display: flex; flex-wrap: wrap; gap: 8px; }
+    .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
+    .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
     @media (max-width: 980px) { .layout, .summary { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
   </style>
@@ -281,6 +323,12 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
       <div class="stack">
         <section class="panel">
           <div class="panel-head">
+            <div><h2>Ask AI</h2><div class="muted">Ask about upcoming deadlines, cases, and recent activity</div></div>
+          </div>
+          <div class="panel-body">${chatPanel()}</div>
+        </section>
+        <section class="panel">
+          <div class="panel-head">
             <div><h2>Active Cases</h2><div class="muted">Upcoming case details from notices</div></div>
           </div>
           <div class="panel-body">${caseCards(cases)}</div>
@@ -303,8 +351,107 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, runs, s
   `;
 }
 
+async function loadAttorneyContext() {
+  const [deadlines, cases, events] = await Promise.all([
+    pool.query(`
+      select d.id, d.label, d.due_at, d.date_text, d.confidence, d.source_quote,
+             c.case_name, c.court, c.case_number, c.judge, e.subject, e.received_at
+      from deadlines d
+      join cases c on c.id = d.case_id
+      join emails e on e.gmail_id = d.gmail_id
+      where d.status = 'open'
+      order by d.due_at nulls last, d.created_at desc
+      limit 75
+    `),
+    pool.query(`
+      select c.id, c.case_name, c.court, c.case_number, c.judge,
+             min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
+             count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
+             count(distinct de.id) filter (where de.status = 'open') as open_event_count,
+             max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at
+      from cases c
+      left join deadlines d on d.case_id = c.id
+      left join docket_events de on de.case_id = c.id
+      group by c.id
+      order by next_deadline_at nulls last, latest_activity_at desc nulls last
+      limit 50
+    `),
+    pool.query(`
+      select de.id, de.event_title, de.docket_number, de.filing_party, de.filed_at,
+             de.source_received_at, de.summary, c.case_name, c.court, c.case_number, e.subject
+      from docket_events de
+      join cases c on c.id = de.case_id
+      join emails e on e.gmail_id = de.gmail_id
+      where de.status = 'open'
+      order by de.source_received_at desc nulls last, de.created_at desc
+      limit 75
+    `)
+  ]);
+
+  return {
+    openDeadlines: deadlines.rows,
+    activeCases: cases.rows,
+    recentCourtActivity: events.rows
+  };
+}
+
 function metric(label, value) {
   return `<div class="metric"><div class="eyebrow">${escapeHtml(label)}</div><strong>${Number(value || 0)}</strong></div>`;
+}
+
+function chatPanel() {
+  return `
+    <div class="chat-box">
+      <div class="quick-prompts">
+        <button class="prompt-chip" type="button" data-prompt="What are the next 7 days of deadlines?">Next 7 days</button>
+        <button class="prompt-chip" type="button" data-prompt="Which cases need attorney review right now?">Needs review</button>
+        <button class="prompt-chip" type="button" data-prompt="Summarize upcoming case activity by case.">By case</button>
+      </div>
+      <textarea id="chat-question" class="chat-input" placeholder="Ask: What do I need to know for upcoming deadlines this week?"></textarea>
+      <div class="toolbar">
+        <button id="chat-submit" type="button">Ask</button>
+        <span id="chat-status" class="muted"></span>
+      </div>
+      <div id="chat-answer" class="chat-answer muted">Ask a question about upcoming deadlines, active cases, filings, or what needs review.</div>
+    </div>
+    <script>
+      const questionEl = document.getElementById("chat-question");
+      const answerEl = document.getElementById("chat-answer");
+      const statusEl = document.getElementById("chat-status");
+      const submitEl = document.getElementById("chat-submit");
+      async function askAi(question) {
+        if (!question.trim()) return;
+        statusEl.textContent = "Thinking...";
+        submitEl.disabled = true;
+        answerEl.classList.remove("muted");
+        answerEl.textContent = "";
+        try {
+          const response = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ question })
+          });
+          const data = await response.json();
+          answerEl.textContent = data.answer || data.error || "No answer returned.";
+        } catch (_error) {
+          answerEl.textContent = "The AI chat could not answer right now.";
+        } finally {
+          statusEl.textContent = "";
+          submitEl.disabled = false;
+        }
+      }
+      submitEl.addEventListener("click", () => askAi(questionEl.value));
+      questionEl.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") askAi(questionEl.value);
+      });
+      document.querySelectorAll("[data-prompt]").forEach((button) => {
+        button.addEventListener("click", () => {
+          questionEl.value = button.getAttribute("data-prompt");
+          askAi(questionEl.value);
+        });
+      });
+    </script>
+  `;
 }
 
 function deadlineTable(deadlines, compact) {
