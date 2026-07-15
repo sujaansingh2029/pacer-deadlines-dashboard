@@ -1,13 +1,18 @@
 import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
+import multer from "multer";
 import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
 import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { authUrl, exchangeCode } from "./gmail.js";
-import { refreshDocumentFromSource, syncMailbox } from "./sync.js";
+import { readDocumentText, refreshDocumentFromSource, syncMailbox } from "./sync.js";
 
 const app = express();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 30 * 1024 * 1024 }
+});
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cookieParser(config.sessionSecret));
@@ -92,7 +97,7 @@ app.get("/", async (_req, res) => {
       select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
              doc.source_url, doc.source_type, doc.extracted_text, doc.created_at, e.subject, e.received_at
       from documents doc
-      join emails e on e.gmail_id = doc.gmail_id
+      left join emails e on e.gmail_id = doc.gmail_id
       order by doc.created_at desc
       limit 200
     `),
@@ -156,6 +161,36 @@ app.post("/deadlines/:id/archive", async (req, res) => {
 
 app.post("/events/:id/archive", async (req, res) => {
   await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
+  res.redirect(req.get("referer") || "/");
+});
+
+app.post("/cases/:id/documents", upload.single("document"), async (req, res) => {
+  const caseId = Number(req.params.id);
+  const caseResult = await pool.query("select id from cases where id = $1", [caseId]);
+  if (!caseResult.rowCount) return res.status(404).send("Case not found.");
+  if (!req.file?.buffer?.length) return res.status(400).send("Choose a PDF or document to upload.");
+
+  const attachment = {
+    filename: req.file.originalname || "Uploaded document.pdf",
+    mimeType: req.file.mimetype || "application/octet-stream",
+    size: req.file.size,
+    content: req.file.buffer
+  };
+  const extracted = await readDocumentText(attachment);
+  await pool.query(
+    `insert into documents
+      (case_id, filename, mime_type, size_bytes, source_type, content, extracted_text, read_status)
+     values ($1,$2,$3,$4,'manual_upload',$5,$6,$7)`,
+    [
+      caseId,
+      attachment.filename,
+      attachment.mimeType,
+      attachment.size,
+      attachment.content,
+      extracted.text,
+      extracted.status
+    ]
+  );
   res.redirect(req.get("referer") || "/");
 });
 
@@ -332,6 +367,9 @@ function layout(title, body) {
     .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
     .document-actions { display: flex; gap: 10px; align-items: center; }
+    .upload-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border: 1px dashed #b8c7e6; border-radius: 8px; padding: 8px; background: #f8fbff; }
+    .upload-form input { max-width: 280px; font-size: 12px; color: var(--muted); }
+    .upload-form button { padding: 7px 10px; font-size: 12px; }
     .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
     .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
     .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
@@ -427,7 +465,7 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Active Cases & Documents</h2><div class="muted">Open a case to see downloaded documents</div></div>
+            <div><h2>Active Cases & Documents</h2><div class="muted">Open a case to see saved documents and upload PDFs when PACER blocks a link</div></div>
           </div>
           <div class="panel-body">${caseCards(cases, documents, deadlines)}</div>
         </section>
@@ -670,7 +708,7 @@ function caseCards(cases, documents, deadlines) {
       ${c.judge ? `<div class="muted" style="margin-top:8px">Judge: ${escapeHtml(c.judge)}</div>` : ""}
       ${c.latest_activity_at ? `<div class="muted" style="margin-top:4px">Latest activity: ${formatDate(c.latest_activity_at)}</div>` : ""}
       ${caseDeadlineList(deadlinesByCase.get(c.id) || [])}
-      ${documentList(docsByCase.get(c.id) || [])}
+      ${documentList(c.id, docsByCase.get(c.id) || [])}
     </details>
   `).join("")}</div>`;
 }
@@ -692,13 +730,20 @@ function caseDeadlineList(deadlines) {
   </div>`;
 }
 
-function documentList(documents) {
-  if (!documents.length) return `<div class="document-list"><div class="case-section-title">Documents</div><div class="muted">No downloaded documents for this case yet.</div></div>`;
-  return `<div class="document-list"><div class="case-section-title">Documents</div>${documents.map((doc) => `
+function documentList(caseId, documents) {
+  const uploadForm = `
+    <form class="upload-form" method="post" action="/cases/${caseId}/documents" enctype="multipart/form-data">
+      <input type="file" name="document" accept=".pdf,.txt,.html,.htm,.doc,.docx,application/pdf,text/plain,text/html">
+      <button type="submit">Upload document</button>
+    </form>`;
+  if (!documents.length) {
+    return `<div class="document-list"><div class="case-section-title">Documents</div><div class="muted">No saved documents for this case yet. If PACER blocks the automatic link, upload the PDF here once and the dashboard will read it.</div>${uploadForm}</div>`;
+  }
+  return `<div class="document-list"><div class="case-section-title">Documents</div>${uploadForm}${documents.map((doc) => `
     <div class="document-row">
       <div>
         <div class="document-name">${escapeHtml(doc.filename)}</div>
-        <div class="muted">${escapeHtml(doc.source_type === "ecf_link" ? "ECF link" : "attachment")} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
+        <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
         ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
       </div>
       <div class="document-actions">
@@ -707,6 +752,12 @@ function documentList(documents) {
       </div>
     </div>
   `).join("")}</div>`;
+}
+
+function sourceLabel(sourceType) {
+  if (sourceType === "ecf_link") return "ECF link";
+  if (sourceType === "manual_upload") return "uploaded";
+  return "attachment";
 }
 
 function archiveButton(action, label) {

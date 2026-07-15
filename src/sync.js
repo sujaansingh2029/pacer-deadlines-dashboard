@@ -418,7 +418,7 @@ function sanitizeFilename(filename) {
     .slice(0, 180) || "document.pdf";
 }
 
-async function readDocumentText(attachment) {
+export async function readDocumentText(attachment) {
   const mimeType = attachment.mimeType || "";
   const filename = attachment.filename || "";
   const content = attachment.content || Buffer.alloc(0);
