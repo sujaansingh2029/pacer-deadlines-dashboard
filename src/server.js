@@ -171,6 +171,18 @@ app.get("/documents/:id/download", async (req, res) => {
   res.send(doc.content);
 });
 
+app.get("/documents/:id/view", async (req, res) => {
+  const result = await pool.query("select filename, mime_type, content, source_url from documents where id = $1", [req.params.id]);
+  const doc = result.rows[0];
+  if (!doc) return res.status(404).send("Document not found.");
+  if (!doc.content && doc.source_url) return res.redirect(doc.source_url);
+  if (!doc.content) return res.status(404).send("Document not downloaded.");
+
+  res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
+  res.setHeader("Content-Disposition", `inline; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
+  res.send(doc.content);
+});
+
 app.post("/api/chat", async (req, res) => {
   const question = String(req.body?.question || "").trim();
   if (!question) return res.status(400).json({ error: "Ask a question first." });
@@ -275,6 +287,7 @@ function layout(title, body) {
     .document-name { font-weight: 800; overflow-wrap: anywhere; }
     .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
+    .document-actions { display: flex; gap: 10px; align-items: center; }
     .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
     .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
     .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
@@ -644,7 +657,10 @@ function documentList(documents) {
         <div class="muted">${escapeHtml(doc.source_type === "ecf_link" ? "ECF link" : "attachment")} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
         ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
       </div>
-      <a class="document-link" href="/documents/${doc.id}/download">Download</a>
+      <div class="document-actions">
+        <a class="document-link" href="/documents/${doc.id}/view" target="_blank" rel="noopener">View</a>
+        <a class="document-link" href="/documents/${doc.id}/download">Download</a>
+      </div>
     </div>
   `).join("")}</div>`;
 }

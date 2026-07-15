@@ -62,6 +62,7 @@ export async function syncMailbox(mailbox) {
     }
 
     documentCount += await backfillMissingDocuments(gmail);
+    await repairHtmlDocumentReads();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
     const summary = `Scanned ${scanned} new message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), downloaded ${documentCount} document(s).`;
@@ -73,6 +74,29 @@ export async function syncMailbox(mailbox) {
   } catch (error) {
     await pool.query("update sync_runs set finished_at = now(), error = $1 where id = $2", [error.stack || error.message, runId]);
     throw error;
+  }
+}
+
+async function repairHtmlDocumentReads() {
+  const result = await pool.query(`
+    select id, filename, mime_type, content
+    from documents
+    where content is not null
+      and mime_type ilike 'text/html%'
+      and read_status like 'read_error:%'
+    limit 100
+  `);
+
+  for (const row of result.rows) {
+    const extracted = await readDocumentText({
+      filename: row.filename,
+      mimeType: row.mime_type,
+      content: row.content
+    });
+    await pool.query(
+      "update documents set extracted_text = $1, read_status = $2 where id = $3",
+      [extracted.text, extracted.status, row.id]
+    );
   }
 }
 
@@ -295,14 +319,14 @@ async function readDocumentText(attachment) {
   const content = attachment.content || Buffer.alloc(0);
 
   try {
+    if (mimeType.startsWith("text/") || mimeType.includes("html") || /\.(txt|csv|html?|xml)$/i.test(filename)) {
+      return { status: "read", text: truncateText(bufferToText(content, mimeType)) };
+    }
+
     if (mimeType.includes("pdf") || filename.toLowerCase().endsWith(".pdf")) {
       const pdfParse = (await import("pdf-parse")).default;
       const parsed = await pdfParse(content);
       return { status: "read", text: truncateText(parsed.text) };
-    }
-
-    if (mimeType.startsWith("text/") || /\.(txt|csv|html?|xml)$/i.test(filename)) {
-      return { status: "read", text: truncateText(bufferToText(content, mimeType)) };
     }
 
     return { status: "stored_unreadable", text: null };
