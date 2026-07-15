@@ -117,35 +117,48 @@ async function repairHtmlLinkedDocuments() {
 
   let repaired = 0;
   for (const row of result.rows) {
-    const downloaded = await downloadLinkedDocument({
-      url: row.source_url,
-      filename: row.filename || "ECF document.pdf"
-    });
-    const extracted = await readDocumentText(downloaded);
-    const status = downloaded.status === "downloaded" ? extracted.status : downloaded.status;
-    await pool.query(
-      `update documents
-       set filename = $1,
-           mime_type = $2,
-           size_bytes = $3,
-           content = $4,
-           extracted_text = $5,
-           read_status = $6,
-           updated_at = now()
-       where id = $7`,
-      [
-        downloaded.filename,
-        downloaded.mimeType,
-        downloaded.size,
-        downloaded.content,
-        extracted.text,
-        status,
-        row.id
-      ]
-    );
-    if (downloaded.status === "downloaded") repaired += 1;
+    const doc = await refreshDocumentFromSource(row.id);
+    if (doc?.content && doc?.read_status !== "download_error") repaired += 1;
   }
   return repaired;
+}
+
+export async function refreshDocumentFromSource(documentId) {
+  const result = await pool.query(
+    "select id, filename, source_url from documents where id = $1 and source_type = 'ecf_link' and source_url is not null",
+    [documentId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+
+  const downloaded = await downloadLinkedDocument({
+    url: row.source_url,
+    filename: row.filename || "ECF document.pdf"
+  });
+  const extracted = await readDocumentText(downloaded);
+  const status = downloaded.status === "downloaded" ? extracted.status : downloaded.status;
+  const updated = await pool.query(
+    `update documents
+     set filename = $1,
+         mime_type = $2,
+         size_bytes = $3,
+         content = $4,
+         extracted_text = $5,
+         read_status = $6,
+         updated_at = now()
+     where id = $7
+     returning filename, mime_type, content, read_status`,
+    [
+      downloaded.filename,
+      downloaded.mimeType,
+      downloaded.size,
+      downloaded.content,
+      extracted.text,
+      status,
+      row.id
+    ]
+  );
+  return updated.rows[0] || null;
 }
 
 async function backfillMissingDocuments(gmail) {
@@ -348,6 +361,13 @@ async function fetchDocumentUrl(url, fallbackFilename, depth) {
     if (nestedUrl && nestedUrl !== url) {
       return await fetchDocumentUrl(nestedUrl, filename, depth + 1);
     }
+    return {
+      filename,
+      mimeType: contentType,
+      size: content.length,
+      content,
+      status: "download_error: court returned an HTML page instead of the document"
+    };
   }
 
   return {

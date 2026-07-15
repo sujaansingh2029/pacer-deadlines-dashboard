@@ -5,7 +5,7 @@ import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
 import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { authUrl, exchangeCode } from "./gmail.js";
-import { syncMailbox } from "./sync.js";
+import { refreshDocumentFromSource, syncMailbox } from "./sync.js";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -160,11 +160,9 @@ app.post("/events/:id/archive", async (req, res) => {
 });
 
 app.get("/documents/:id/download", async (req, res) => {
-  const result = await pool.query("select filename, mime_type, content, source_url from documents where id = $1", [req.params.id]);
-  const doc = result.rows[0];
+  const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
-  if (!doc.content && doc.source_url) return res.redirect(doc.source_url);
-  if (!doc.content) return res.status(404).send("Document not downloaded.");
+  if (!isServableDocument(doc)) return res.status(409).send(documentUnavailableHtml(doc, "download"));
 
   res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
   res.setHeader("Content-Disposition", `attachment; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
@@ -172,16 +170,62 @@ app.get("/documents/:id/download", async (req, res) => {
 });
 
 app.get("/documents/:id/view", async (req, res) => {
-  const result = await pool.query("select filename, mime_type, content, source_url from documents where id = $1", [req.params.id]);
-  const doc = result.rows[0];
+  const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
-  if (!doc.content && doc.source_url) return res.redirect(doc.source_url);
-  if (!doc.content) return res.status(404).send("Document not downloaded.");
+  if (!isServableDocument(doc)) return res.status(409).send(documentUnavailableHtml(doc, "view"));
 
   res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
   res.setHeader("Content-Disposition", `inline; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
   res.send(doc.content);
 });
+
+async function loadDocumentForServing(id) {
+  const result = await pool.query(
+    "select id, filename, mime_type, content, source_url, source_type, read_status from documents where id = $1",
+    [id]
+  );
+  let doc = result.rows[0];
+  if (!doc) return null;
+
+  const needsRepair =
+    doc.source_type === "ecf_link" &&
+    doc.source_url &&
+    (!doc.content ||
+      String(doc.mime_type || "").toLowerCase().includes("html") ||
+      String(doc.read_status || "").startsWith("read_error:") ||
+      String(doc.read_status || "").startsWith("download_error:"));
+
+  if (needsRepair) {
+    const repaired = await refreshDocumentFromSource(doc.id);
+    if (repaired) doc = { ...doc, ...repaired };
+  }
+
+  return doc;
+}
+
+function isServableDocument(doc) {
+  if (!doc.content) return false;
+  const mimeType = String(doc.mime_type || "").toLowerCase();
+  if (doc.source_type === "ecf_link" && mimeType.includes("html")) return false;
+  return true;
+}
+
+function documentUnavailableHtml(doc, action) {
+  const status = escapeHtml(doc.read_status || "not downloaded");
+  const title = action === "download" ? "Document is not ready to download" : "Document is not ready to view";
+  return layout(
+    title,
+    `<section class="panel narrow">
+      <div class="panel-body">
+        <h1>${title}</h1>
+        <p>The dashboard tried to fetch this ECF document again, but the court did not return a saved document file.</p>
+        <p class="muted">Status: ${status}</p>
+        <p>This usually means the ECF free-look link is expired, already consumed, or the court requires a PACER login before releasing the file. The dashboard cannot bypass PACER authentication, but it will automatically save and read documents when the court link returns the actual PDF or text file.</p>
+        <a class="button secondary" href="/">Back to dashboard</a>
+      </div>
+    </section>`
+  );
+}
 
 app.post("/api/chat", async (req, res) => {
   const question = String(req.body?.question || "").trim();
