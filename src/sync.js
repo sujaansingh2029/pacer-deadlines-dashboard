@@ -78,12 +78,10 @@ export async function syncMailbox(mailbox) {
 
 async function backfillMissingDocuments(gmail) {
   const result = await pool.query(`
-    select e.gmail_id, de.case_id
+    select distinct e.gmail_id, de.case_id, e.received_at
     from emails e
     join docket_events de on de.gmail_id = e.gmail_id
-    left join documents doc on doc.gmail_id = e.gmail_id
     where e.is_court_notice = true
-      and doc.id is null
     order by e.received_at desc nulls last
     limit 50
   `);
@@ -162,8 +160,8 @@ async function saveDocuments(caseId, email) {
     const extracted = await readDocumentText(attachment);
     const result = await pool.query(
       `insert into documents
-        (case_id, gmail_id, filename, mime_type, size_bytes, source_attachment_id, content, extracted_text, read_status)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+        (case_id, gmail_id, filename, mime_type, size_bytes, source_attachment_id, source_type, content, extracted_text, read_status)
+       values ($1,$2,$3,$4,$5,$6,'attachment',$7,$8,$9)
        on conflict (gmail_id, filename, size_bytes) do nothing
        returning id`,
       [
@@ -180,7 +178,115 @@ async function saveDocuments(caseId, email) {
     );
     if (result.rowCount) count += 1;
   }
+
+  for (const linkedDocument of extractDocumentLinks(email.bodyText).slice(0, 10)) {
+    const existing = await pool.query("select 1 from documents where source_url = $1", [linkedDocument.url]);
+    if (existing.rowCount) continue;
+
+    const downloaded = await downloadLinkedDocument(linkedDocument);
+    const extracted = await readDocumentText(downloaded);
+    const result = await pool.query(
+      `insert into documents
+        (case_id, gmail_id, filename, mime_type, size_bytes, source_url, source_type, content, extracted_text, read_status)
+       values ($1,$2,$3,$4,$5,$6,'ecf_link',$7,$8,$9)
+       on conflict do nothing
+       returning id`,
+      [
+        caseId,
+        email.id,
+        downloaded.filename,
+        downloaded.mimeType,
+        downloaded.size,
+        linkedDocument.url,
+        downloaded.content,
+        extracted.text,
+        downloaded.status === "downloaded" ? extracted.status : downloaded.status
+      ]
+    );
+    if (result.rowCount) count += 1;
+  }
   return count;
+}
+
+function extractDocumentLinks(text) {
+  const links = [];
+  const seen = new Set();
+  const body = String(text || "").replaceAll("&amp;", "&");
+  const urlPattern = /https?:\/\/[^\s<>"')]+/gi;
+  for (const match of body.matchAll(urlPattern)) {
+    const rawUrl = match[0].replace(/[.,;]+$/g, "");
+    if (!/\/doc1\//i.test(rawUrl)) continue;
+    if (seen.has(rawUrl)) continue;
+    seen.add(rawUrl);
+
+    const start = Math.max(0, match.index - 800);
+    const end = Math.min(body.length, match.index + rawUrl.length + 1200);
+    const context = body.slice(start, end);
+    const originalName = context.match(/Original filename:\s*([^\n\r]+)/i)?.[1]?.trim();
+    const docNumber = context.match(/Document Number:\s*([^\n\r]+)/i)?.[1]?.trim();
+    links.push({
+      url: rawUrl,
+      filename: sanitizeFilename(originalName || (docNumber ? `Document ${docNumber}.pdf` : "ECF document.pdf"))
+    });
+  }
+  return links;
+}
+
+async function downloadLinkedDocument(linkedDocument) {
+  try {
+    const response = await fetch(linkedDocument.url, {
+      redirect: "follow",
+      headers: {
+        "User-Agent": "Mozilla/5.0 PACER Deadlines Dashboard",
+        "Accept": "application/pdf,text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8"
+      }
+    });
+    const arrayBuffer = await response.arrayBuffer();
+    const content = Buffer.from(arrayBuffer);
+    const contentType = response.headers.get("content-type") || "application/octet-stream";
+    const disposition = response.headers.get("content-disposition") || "";
+    const filename = sanitizeFilename(filenameFromDisposition(disposition) || linkedDocument.filename);
+
+    if (!response.ok) {
+      return {
+        filename,
+        mimeType: contentType,
+        size: content.length,
+        content,
+        status: `download_error: HTTP ${response.status}`
+      };
+    }
+
+    return {
+      filename,
+      mimeType: contentType,
+      size: content.length,
+      content,
+      status: "downloaded"
+    };
+  } catch (error) {
+    return {
+      filename: linkedDocument.filename,
+      mimeType: "application/octet-stream",
+      size: null,
+      content: null,
+      status: `download_error: ${error.message}`.slice(0, 200)
+    };
+  }
+}
+
+function filenameFromDisposition(disposition) {
+  return disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1]
+    ? decodeURIComponent(disposition.match(/filename\*=UTF-8''([^;]+)/i)[1])
+    : disposition.match(/filename="?([^";]+)"?/i)?.[1];
+}
+
+function sanitizeFilename(filename) {
+  return String(filename || "document.pdf")
+    .replace(/[\\/:*?"<>|]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180) || "document.pdf";
 }
 
 async function readDocumentText(attachment) {

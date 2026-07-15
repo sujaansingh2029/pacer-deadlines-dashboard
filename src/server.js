@@ -90,7 +90,7 @@ app.get("/", async (_req, res) => {
     `),
     pool.query(`
       select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
-             doc.extracted_text, doc.created_at, e.subject, e.received_at
+             doc.source_url, doc.source_type, doc.extracted_text, doc.created_at, e.subject, e.received_at
       from documents doc
       join emails e on e.gmail_id = doc.gmail_id
       order by doc.created_at desc
@@ -160,9 +160,11 @@ app.post("/events/:id/archive", async (req, res) => {
 });
 
 app.get("/documents/:id/download", async (req, res) => {
-  const result = await pool.query("select filename, mime_type, content from documents where id = $1", [req.params.id]);
+  const result = await pool.query("select filename, mime_type, content, source_url from documents where id = $1", [req.params.id]);
   const doc = result.rows[0];
-  if (!doc || !doc.content) return res.status(404).send("Document not found.");
+  if (!doc) return res.status(404).send("Document not found.");
+  if (!doc.content && doc.source_url) return res.redirect(doc.source_url);
+  if (!doc.content) return res.status(404).send("Document not downloaded.");
 
   res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
   res.setHeader("Content-Disposition", `attachment; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
@@ -441,7 +443,7 @@ async function loadAttorneyContext() {
 
   const documents = await pool.query(`
     select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
-           left(doc.extracted_text, 2500) as extracted_text, c.case_name, c.court, c.case_number
+           doc.source_url, doc.source_type, left(doc.extracted_text, 2500) as extracted_text, c.case_name, c.court, c.case_number
     from documents doc
     join cases c on c.id = doc.case_id
     order by doc.created_at desc
@@ -639,7 +641,7 @@ function documentList(documents) {
     <div class="document-row">
       <div>
         <div class="document-name">${escapeHtml(doc.filename)}</div>
-        <div class="muted">${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
+        <div class="muted">${escapeHtml(doc.source_type === "ecf_link" ? "ECF link" : "attachment")} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
         ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
       </div>
       <a class="document-link" href="/documents/${doc.id}/download">Download</a>

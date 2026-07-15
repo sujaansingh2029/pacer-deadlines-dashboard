@@ -82,6 +82,8 @@ export async function initDb() {
       mime_type text,
       size_bytes integer,
       source_attachment_id text,
+      source_url text,
+      source_type text not null default 'attachment',
       content bytea,
       extracted_text text,
       read_status text not null default 'pending',
@@ -109,10 +111,13 @@ export async function initDb() {
     alter table deadlines add column if not exists archived_at timestamptz;
     alter table documents add column if not exists extracted_text text;
     alter table documents add column if not exists read_status text not null default 'pending';
+    alter table documents add column if not exists source_url text;
+    alter table documents add column if not exists source_type text not null default 'attachment';
     alter table sync_runs add column if not exists document_count integer not null default 0;
     create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at);
     create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc);
     create index if not exists documents_case_id_idx on documents (case_id, created_at desc);
+    create unique index if not exists documents_source_url_idx on documents (source_url) where source_url is not null;
   `);
 }
 
