@@ -63,6 +63,7 @@ export async function syncMailbox(mailbox) {
 
     documentCount += await backfillMissingDocuments(gmail);
     await repairHtmlDocumentReads();
+    documentCount += await repairHtmlLinkedDocuments();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
     const summary = `Scanned ${scanned} new message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), downloaded ${documentCount} document(s).`;
@@ -98,6 +99,53 @@ async function repairHtmlDocumentReads() {
       [extracted.text, extracted.status, row.id]
     );
   }
+}
+
+async function repairHtmlLinkedDocuments() {
+  const result = await pool.query(`
+    select id, filename, source_url
+    from documents
+    where source_type = 'ecf_link'
+      and source_url is not null
+      and (
+        mime_type ilike 'text/html%'
+        or read_status like 'read_error:%'
+        or read_status like 'download_error:%'
+      )
+    limit 100
+  `);
+
+  let repaired = 0;
+  for (const row of result.rows) {
+    const downloaded = await downloadLinkedDocument({
+      url: row.source_url,
+      filename: row.filename || "ECF document.pdf"
+    });
+    const extracted = await readDocumentText(downloaded);
+    const status = downloaded.status === "downloaded" ? extracted.status : downloaded.status;
+    await pool.query(
+      `update documents
+       set filename = $1,
+           mime_type = $2,
+           size_bytes = $3,
+           content = $4,
+           extracted_text = $5,
+           read_status = $6,
+           updated_at = now()
+       where id = $7`,
+      [
+        downloaded.filename,
+        downloaded.mimeType,
+        downloaded.size,
+        downloaded.content,
+        extracted.text,
+        status,
+        row.id
+      ]
+    );
+    if (downloaded.status === "downloaded") repaired += 1;
+  }
+  return repaired;
 }
 
 async function backfillMissingDocuments(gmail) {
@@ -258,36 +306,7 @@ function extractDocumentLinks(text) {
 
 async function downloadLinkedDocument(linkedDocument) {
   try {
-    const response = await fetch(linkedDocument.url, {
-      redirect: "follow",
-      headers: {
-        "User-Agent": "Mozilla/5.0 PACER Deadlines Dashboard",
-        "Accept": "application/pdf,text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8"
-      }
-    });
-    const arrayBuffer = await response.arrayBuffer();
-    const content = Buffer.from(arrayBuffer);
-    const contentType = response.headers.get("content-type") || "application/octet-stream";
-    const disposition = response.headers.get("content-disposition") || "";
-    const filename = sanitizeFilename(filenameFromDisposition(disposition) || linkedDocument.filename);
-
-    if (!response.ok) {
-      return {
-        filename,
-        mimeType: contentType,
-        size: content.length,
-        content,
-        status: `download_error: HTTP ${response.status}`
-      };
-    }
-
-    return {
-      filename,
-      mimeType: contentType,
-      size: content.length,
-      content,
-      status: "downloaded"
-    };
+    return await fetchDocumentUrl(linkedDocument.url, linkedDocument.filename, 0);
   } catch (error) {
     return {
       filename: linkedDocument.filename,
@@ -297,6 +316,72 @@ async function downloadLinkedDocument(linkedDocument) {
       status: `download_error: ${error.message}`.slice(0, 200)
     };
   }
+}
+
+async function fetchDocumentUrl(url, fallbackFilename, depth) {
+  const response = await fetch(url, {
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Mozilla/5.0 PACER Deadlines Dashboard",
+      "Accept": "application/pdf,text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8"
+    }
+  });
+  const arrayBuffer = await response.arrayBuffer();
+  const content = Buffer.from(arrayBuffer);
+  const headerContentType = response.headers.get("content-type") || "application/octet-stream";
+  const contentType = sniffMimeType(content, headerContentType);
+  const disposition = response.headers.get("content-disposition") || "";
+  const filename = sanitizeFilename(filenameFromDisposition(disposition) || fallbackFilename);
+
+  if (!response.ok) {
+    return {
+      filename,
+      mimeType: contentType,
+      size: content.length,
+      content,
+      status: `download_error: HTTP ${response.status}`
+    };
+  }
+
+  if (depth < 2 && contentType.includes("html")) {
+    const nestedUrl = findNestedDocumentUrl(content.toString("utf8"), response.url || url);
+    if (nestedUrl && nestedUrl !== url) {
+      return await fetchDocumentUrl(nestedUrl, filename, depth + 1);
+    }
+  }
+
+  return {
+    filename,
+    mimeType: contentType,
+    size: content.length,
+    content,
+    status: "downloaded"
+  };
+}
+
+function sniffMimeType(content, headerContentType) {
+  const prefix = content.subarray(0, 300).toString("utf8").trimStart().toLowerCase();
+  if (content.subarray(0, 5).toString("utf8") === "%PDF-") return "application/pdf";
+  if (prefix.startsWith("<!doctype html") || prefix.startsWith("<html") || prefix.includes("<body")) {
+    return "text/html; charset=UTF-8";
+  }
+  return headerContentType || "application/octet-stream";
+}
+
+function findNestedDocumentUrl(html, baseUrl) {
+  const candidates = [];
+  const pattern = /\b(?:href|src|action)=["']([^"']+)["']/gi;
+  for (const match of html.matchAll(pattern)) {
+    try {
+      const resolved = new URL(match[1].replaceAll("&amp;", "&"), baseUrl).toString();
+      if (/\/doc1\//i.test(resolved) || /\.pdf(?:[?#]|$)/i.test(resolved) || /pdf_header/i.test(resolved)) {
+        candidates.push(resolved);
+      }
+    } catch {
+      // Ignore invalid links in court-generated HTML.
+    }
+  }
+  return candidates.find((candidate) => candidate !== baseUrl) || null;
 }
 
 function filenameFromDisposition(disposition) {
@@ -319,6 +404,12 @@ async function readDocumentText(attachment) {
   const content = attachment.content || Buffer.alloc(0);
 
   try {
+    if (content.subarray(0, 5).toString("utf8") === "%PDF-") {
+      const pdfParse = (await import("pdf-parse")).default;
+      const parsed = await pdfParse(content);
+      return { status: "read", text: truncateText(parsed.text) };
+    }
+
     if (mimeType.startsWith("text/") || mimeType.includes("html") || /\.(txt|csv|html?|xml)$/i.test(filename)) {
       return { status: "read", text: truncateText(bufferToText(content, mimeType)) };
     }

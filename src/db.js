@@ -88,6 +88,7 @@ export async function initDb() {
       extracted_text text,
       read_status text not null default 'pending',
       created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
       unique (gmail_id, filename, size_bytes)
     );
 
@@ -113,6 +114,7 @@ export async function initDb() {
     alter table documents add column if not exists read_status text not null default 'pending';
     alter table documents add column if not exists source_url text;
     alter table documents add column if not exists source_type text not null default 'attachment';
+    alter table documents add column if not exists updated_at timestamptz not null default now();
     alter table sync_runs add column if not exists document_count integer not null default 0;
     create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at);
     create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc);
