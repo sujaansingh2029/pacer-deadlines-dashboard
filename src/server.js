@@ -273,6 +273,9 @@ function layout(title, body) {
     .document-name { font-weight: 800; overflow-wrap: anywhere; }
     .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
+    .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
+    .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
+    .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
     .chat-box { display: grid; gap: 10px; }
     .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
     .chat-input { box-sizing: border-box; width: 100%; min-height: 82px; resize: vertical; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; font: inherit; font-size: 13px; }
@@ -367,7 +370,7 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
           <div class="panel-head">
             <div><h2>Active Cases & Documents</h2><div class="muted">Open a case to see downloaded documents</div></div>
           </div>
-          <div class="panel-body">${caseCards(cases, documents)}</div>
+          <div class="panel-body">${caseCards(cases, documents, deadlines)}</div>
         </section>
         <section class="panel">
           <div class="panel-head">
@@ -578,13 +581,19 @@ function activityList(events) {
     </div>`).join("")}</div>`;
 }
 
-function caseCards(cases, documents) {
+function caseCards(cases, documents, deadlines) {
   if (!cases.length) return `<div class="empty">No cases found yet. Run a sync after connecting Gmail.</div>`;
   const docsByCase = new Map();
   for (const doc of documents || []) {
     const list = docsByCase.get(doc.case_id) || [];
     list.push(doc);
     docsByCase.set(doc.case_id, list);
+  }
+  const deadlinesByCase = new Map();
+  for (const deadline of deadlines || []) {
+    const list = deadlinesByCase.get(deadline.case_id) || [];
+    list.push(deadline);
+    deadlinesByCase.set(deadline.case_id, list);
   }
 
   return `<div class="small-list">${cases.map((c) => `
@@ -601,14 +610,32 @@ function caseCards(cases, documents) {
       </summary>
       ${c.judge ? `<div class="muted" style="margin-top:8px">Judge: ${escapeHtml(c.judge)}</div>` : ""}
       ${c.latest_activity_at ? `<div class="muted" style="margin-top:4px">Latest activity: ${formatDate(c.latest_activity_at)}</div>` : ""}
+      ${caseDeadlineList(deadlinesByCase.get(c.id) || [])}
       ${documentList(docsByCase.get(c.id) || [])}
     </details>
   `).join("")}</div>`;
 }
 
+function caseDeadlineList(deadlines) {
+  if (!deadlines.length) {
+    return `<div class="case-deadlines"><div class="case-section-title">Due Dates</div><div class="muted">No open due dates extracted for this case yet.</div></div>`;
+  }
+
+  return `<div class="case-deadlines">
+    <div class="case-section-title">Due Dates</div>
+    ${deadlines.map((deadline) => `
+      <div class="case-deadline-row">
+        <div>${archiveButton(`/deadlines/${deadline.id}/archive`, "Archive deadline")}</div>
+        <div><span class="due">${formatDate(deadline.due_at) || escapeHtml(deadline.date_text || "Needs review")}</span><br>${confidenceTag(deadline.confidence)}</div>
+        <div><strong>${escapeHtml(deadline.label)}</strong>${deadline.source_quote ? `<br><span class="muted">${escapeHtml(deadline.source_quote)}</span>` : ""}<br><span class="muted">${escapeHtml(deadline.subject || "")}</span></div>
+      </div>
+    `).join("")}
+  </div>`;
+}
+
 function documentList(documents) {
-  if (!documents.length) return `<div class="document-list"><div class="muted">No downloaded documents for this case yet.</div></div>`;
-  return `<div class="document-list">${documents.map((doc) => `
+  if (!documents.length) return `<div class="document-list"><div class="case-section-title">Documents</div><div class="muted">No downloaded documents for this case yet.</div></div>`;
+  return `<div class="document-list"><div class="case-section-title">Documents</div>${documents.map((doc) => `
     <div class="document-row">
       <div>
         <div class="document-name">${escapeHtml(doc.filename)}</div>
