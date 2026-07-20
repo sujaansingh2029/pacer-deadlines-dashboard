@@ -225,6 +225,7 @@ function addSafetyNetDates(email, extraction) {
 
   for (const match of body.matchAll(ABSOLUTE_DATE_PATTERN)) {
     const context = contextAround(body, match.index, match[0].length);
+    if (isNonActionableDateContext(context)) continue;
     const parsedDate = parseDate(match[0]);
     const key = normalizeDateKey(match[0]);
     const parsedKey = normalizeDateKey(parsedDate || "");
@@ -273,9 +274,19 @@ function labelForDateContext(context, dateText) {
   if (lower.includes("payment")) return `Possible payment date/deadline: ${dateText}`;
   if (lower.includes("plan")) return `Possible plan deadline: ${dateText}`;
   if (lower.includes("cure")) return `Possible cure deadline: ${dateText}`;
-  if (lower.includes("serve") || lower.includes("service")) return `Possible service deadline: ${dateText}`;
+  if ((lower.includes("serve") || lower.includes("service")) && /\b(?:deadline|due|must|shall|required|ordered|no later|on or before|by)\b/i.test(lower)) return `Possible service deadline: ${dateText}`;
   if (lower.includes("appear")) return `Possible appearance/hearing date: ${dateText}`;
   return `Possible court date/deadline: ${dateText}`;
+}
+
+function isNonActionableDateContext(context) {
+  const lower = String(context || "").toLowerCase();
+  if (/notice of electronic filing/.test(lower) && /\b(?:received|entered|filed)\b/.test(lower)) return true;
+  if (/\b(?:entered|filed|received)\s+(?:on|from)\b/.test(lower) && !/\b(?:deadline|due|must|shall|required|ordered|hearing|objection|response|reply|trial|conference|meeting|appearance)\b/.test(lower)) return true;
+  if (/\bnotice date\b/.test(lower) && !/\b(?:deadline|due|hearing|objection|response|reply|trial|conference|meeting)\b/.test(lower)) return true;
+  if (/public access users|one free electronic copy|pacer access fees|30-page limit/.test(lower)) return true;
+  if (/certificate of service/.test(lower) && !/\b(?:deadline|due|must|shall|required|ordered|no later|on or before)\b/.test(lower)) return true;
+  return false;
 }
 
 function contextAround(text, index, length) {

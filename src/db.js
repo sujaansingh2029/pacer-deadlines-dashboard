@@ -147,6 +147,30 @@ export async function getPrimaryMailbox() {
 
 export async function moveOldOpenItemsToHistory() {
   await pool.query(`
+    update deadlines
+    set status = 'history_auto',
+        archived_at = coalesce(archived_at, now())
+    where status = 'open'
+      and confidence = 'needs_review'
+      and (
+        lower(coalesce(label, '')) = 'notice date'
+        or lower(coalesce(label, '')) like 'possible service deadline:%'
+        or lower(coalesce(source_quote, '')) like '%notice of electronic filing%transaction was received%'
+        or lower(coalesce(source_quote, '')) like '%public access users%'
+        or lower(coalesce(source_quote, '')) like '%one free electronic copy%'
+        or lower(coalesce(source_quote, '')) like '%pacer access fees%'
+        or (
+          lower(coalesce(source_quote, '')) like '%entered on%'
+          and lower(coalesce(source_quote, '')) like '%filed on%'
+          and lower(coalesce(source_quote, '')) not like '%deadline%'
+          and lower(coalesce(source_quote, '')) not like '%hearing%'
+          and lower(coalesce(source_quote, '')) not like '%objection%'
+          and lower(coalesce(source_quote, '')) not like '%response%'
+        )
+      )
+  `);
+
+  await pool.query(`
     update emails
     set is_court_notice = false,
         review_status = 'archived',

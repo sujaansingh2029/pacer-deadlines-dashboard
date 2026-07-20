@@ -71,6 +71,7 @@ app.get("/", async (_req, res) => {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
+        and d.confidence <> 'needs_review'
         and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
       order by d.due_at asc
       limit 25
@@ -97,7 +98,7 @@ app.get("/", async (_req, res) => {
     pool.query(`
       select
         c.*,
-        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
+        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null and d.confidence <> 'needs_review') as next_deadline_at,
         count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
         count(distinct de.id) filter (where de.status = 'open') as open_event_count,
         max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at,
@@ -195,9 +196,9 @@ app.get("/", async (_req, res) => {
     pool.query(`
       select
         (select count(*) from deadlines where status = 'open') as open_deadlines,
-        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
-        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
-        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
+        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
+        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
+        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
         (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
         (select count(*) from documents) as documents,
@@ -307,6 +308,7 @@ function deadlineWindowQuery(startDays, endDays) {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
+        and d.confidence <> 'needs_review'
         and d.due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + ($1::int * interval '1 day')) at time zone 'America/New_York')
         and d.due_at < ((date_trunc('day', now() at time zone 'America/New_York') + ($2::int * interval '1 day')) at time zone 'America/New_York')
       order by d.due_at asc, d.created_at desc
@@ -732,7 +734,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           ${simpleCount("Manual review", manualReview.length)}
           ${simpleCount("PDF uploads", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
-          ${simpleCount("Need review", stats.needs_review)}
+          ${simpleCount("Possible dates", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
           ${simpleCount("Docs read", stats.read_documents)}
           ${simpleCount("History", stats.history_items)}
@@ -745,12 +747,13 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
     <div class="layout">
       <div class="stack">
         ${manualReviewSection(manualReview)}
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>Needs Review</h2><div class="muted">Start here. These are uncertain or missing dates.</div></div>
-          </div>
+        <details class="panel">
+          <summary class="panel-head">
+            <div><h2>Possible Dates</h2><div class="muted">Lower-confidence dates found in notices or documents. These do not count as due today/tomorrow unless the system sees action language.</div></div>
+            <span class="muted">Open</span>
+          </summary>
           ${deadlineTable(needsReview, true)}
-        </section>
+        </details>
         <section class="panel">
           <div class="panel-head">
             <div><h2>Deadline Calendar</h2><div class="muted">Date ordered, with the email received date shown for every item.</div></div>
@@ -832,7 +835,7 @@ function dueBucket(title, items, tone, emptyText) {
 }
 
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
-  const nextDeadline = deadlines.find((deadline) => deadline.due_at) || deadlines[0];
+  const nextDeadline = deadlines.find((deadline) => deadline.due_at && deadline.confidence !== "needs_review");
   const reviewText = manualReview.length
     ? `${manualReview.length} active item(s). Check off anything already handled.`
     : "Nothing urgent is waiting for manual review.";
@@ -845,7 +848,7 @@ function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments
     </div>
     <div class="steps">
       ${stepCard("1", "Fix urgent review items", reviewText, manualReview.length ? "review" : "good")}
-      ${stepCard("2", "Check uncertain dates", needsReview.length ? `${needsReview.length} deadline/date item(s) need verification.` : "No uncertain extracted dates right now.", needsReview.length ? "review" : "good")}
+      ${stepCard("2", "Possible dates found", needsReview.length ? `${needsReview.length} lower-confidence date(s) are saved below, not treated as urgent.` : "No extra possible dates right now.", needsReview.length ? "normal" : "good")}
       ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
       ${stepCard("4", "Upload full PDFs when needed", pdfText, blockedDocuments.length ? "review" : "good")}
     </div>
@@ -923,13 +926,14 @@ async function loadAttorneyContext() {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
+        and d.confidence <> 'needs_review'
         and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
       order by d.due_at asc
       limit 25
     `),
     pool.query(`
       select c.id, c.case_name, c.court, c.case_number, c.judge,
-             min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
+             min(d.due_at) filter (where d.status = 'open' and d.due_at is not null and d.confidence <> 'needs_review') as next_deadline_at,
              count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
              count(distinct de.id) filter (where de.status = 'open') as open_event_count,
              max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at
@@ -982,15 +986,15 @@ function simpleCount(label, value) {
 }
 
 function summaryList({ deadlines, needsReview, events, cases, stats }) {
-  const nextDeadline = deadlines.find((d) => d.due_at) || deadlines[0];
+  const nextDeadline = deadlines.find((d) => d.due_at && d.confidence !== "needs_review");
   const nextCase = cases.find((c) => c.next_deadline_at) || cases[0];
   const latestEvent = events[0];
   const items = [];
 
   if (Number(stats.needs_review || 0) > 0) {
-    items.push(`${Number(stats.needs_review)} item(s) need attorney review because the date is uncertain or missing.`);
+    items.push(`${Number(stats.needs_review)} lower-confidence date(s) were saved as possible dates, but they are not treated as urgent deadlines.`);
   } else {
-    items.push("No extracted deadlines are currently flagged for attorney review.");
+    items.push("No extra possible dates are waiting in the low-confidence bucket.");
   }
 
   items.push(`${Number(stats.due_today || 0)} item(s) due today and ${Number(stats.due_tomorrow || 0)} item(s) due tomorrow.`);
@@ -998,7 +1002,7 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
   if (nextDeadline) {
     items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Case pending review")} - ${escapeHtml(nextDeadline.label)}.`);
   } else {
-    items.push("No open deadlines have been extracted yet.");
+    items.push("No high-confidence open deadlines have been extracted yet.");
   }
 
   if (nextCase) {
