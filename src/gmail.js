@@ -35,16 +35,16 @@ export function gmailForRefreshToken(refreshToken) {
 }
 
 export async function listIncomingMessages(gmail, afterUnixSeconds, options = {}) {
-  const lookbackDays = options.lookbackDays || 180;
-  const maxMessages = options.maxMessages || 1000;
+  const lookbackDays = options.lookbackDays || 365;
+  const maxMessages = options.maxMessages || 5000;
   const after = afterUnixSeconds ? ` after:${afterUnixSeconds}` : ` newer_than:${lookbackDays}d`;
   const q = `in:anywhere -in:spam -in:trash -in:sent -in:drafts${after}`;
   return listMessagesByQuery(gmail, q, maxMessages);
 }
 
 export async function listCourtNoticeMessages(gmail, options = {}) {
-  const lookbackDays = options.lookbackDays || 180;
-  const maxMessages = options.maxMessages || 1200;
+  const lookbackDays = options.lookbackDays || 365;
+  const maxMessages = options.maxMessages || 5000;
   const q = `in:anywhere -in:spam -in:trash -in:sent -in:drafts newer_than:${lookbackDays}d {pacer cm/ecf uscourts.gov "Notice of Electronic Filing" docket}`;
   return listMessagesByQuery(gmail, q, maxMessages);
 }

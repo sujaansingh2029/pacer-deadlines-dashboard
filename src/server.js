@@ -50,7 +50,7 @@ app.get("/", async (_req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  const [deadlines, needsReview, events, cases, documents, notices, manualReview, runs, stats] = await Promise.all([
+  const [deadlines, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, runs, stats] = await Promise.all([
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
@@ -143,13 +143,24 @@ app.get("/", async (_req, res) => {
         from documents doc
         left join cases c on c.id = doc.case_id
         left join emails e on e.gmail_id = doc.gmail_id
-        where doc.read_status like 'download_error:%'
-           or doc.read_status like 'read_error:%'
+        where doc.read_status like 'read_error:%'
            or doc.read_status = 'stored_unreadable'
-           or doc.document_type = 'Manual review required'
+           or (doc.document_type = 'Manual review required' and coalesce(doc.read_status, '') not like 'download_error:%')
       ) review_items
       order by review_items.received_at desc nulls last
       limit 75
+    `),
+    pool.query(`
+      select doc.id, doc.filename, doc.read_status, doc.source_url, doc.document_summary,
+             coalesce(c.case_name, 'Case pending review') as case_name,
+             coalesce(e.received_at, doc.created_at) as received_at
+      from documents doc
+      left join cases c on c.id = doc.case_id
+      left join emails e on e.gmail_id = doc.gmail_id
+      where doc.read_status like 'download_error:%'
+         or doc.read_status = 'notice_read_pdf_blocked'
+      order by coalesce(e.received_at, doc.created_at) desc
+      limit 100
     `),
     pool.query("select * from sync_runs order by started_at desc limit 5"),
     pool.query(`
@@ -171,6 +182,7 @@ app.get("/", async (_req, res) => {
     documents: documents.rows,
     notices: notices.rows,
     manualReview: manualReview.rows,
+    blockedDocuments: blockedDocuments.rows,
     runs: runs.rows,
     stats: stats.rows[0]
   })));
@@ -276,7 +288,7 @@ app.get("/documents/:id/view", async (req, res) => {
 
 async function loadDocumentForServing(id) {
   const result = await pool.query(
-    "select id, filename, mime_type, content, source_url, source_type, read_status from documents where id = $1",
+    "select id, filename, mime_type, content, source_url, source_type, read_status, document_type, document_summary from documents where id = $1",
     [id]
   );
   let doc = result.rows[0];
@@ -306,16 +318,15 @@ function isServableDocument(doc) {
 }
 
 function documentUnavailableHtml(doc, action) {
-  const status = escapeHtml(doc.read_status || "not downloaded");
   const title = action === "download" ? "Document is not ready to download" : "Document is not ready to view";
   return layout(
     title,
     `<section class="panel narrow">
       <div class="panel-body">
         <h1>${title}</h1>
-        <p>The dashboard tried to fetch this ECF document again, but the court did not return a saved document file.</p>
-        <p class="muted">Status: ${status}</p>
-        <p>This usually means the ECF free-look link is expired, already consumed, or the court requires a PACER login before releasing the file. The dashboard cannot bypass PACER authentication, but it will automatically save and read documents when the court link returns the actual PDF or text file.</p>
+        <p>The dashboard read the court email, but PACER did not release the actual PDF to the server.</p>
+        ${doc.document_summary ? `<p>${escapeHtml(doc.document_summary)}</p>` : ""}
+        <p>Open the document from the PACER email or docket, download the PDF once, then upload it under the matching case. After upload, the dashboard will read and summarize it.</p>
         <a class="button secondary" href="/">Back to dashboard</a>
       </div>
     </section>`
@@ -388,6 +399,12 @@ function layout(title, body) {
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
     .priority-panel { border-color: #f79009; box-shadow: 0 0 0 1px rgba(247, 144, 9, .14); }
     .priority-panel .panel-head { background: #fffbeb; }
+    .start-panel { margin-bottom: 16px; }
+    .steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding: 12px; }
+    .step-card { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; align-items: start; border: 1px solid #e4e7ec; border-radius: 8px; padding: 11px; background: #fff; min-height: 76px; }
+    .step-card.review { border-color: #fedf89; background: #fffbeb; }
+    .step-card.good { border-color: #abefc6; background: #f6fef9; }
+    .step-number { width: 26px; height: 26px; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; background: #e7f0ff; color: #1849a9; font-weight: 900; }
     .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .panel-body { padding: 10px 14px; }
     .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
@@ -444,7 +461,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } }
   </style>
 </head>
 <body>
@@ -484,7 +501,7 @@ function loginHtml(hasError) {
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, notices, manualReview, runs, stats }) {
+function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, runs, stats }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
@@ -507,13 +524,15 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
         <div class="panel-head"><h2>At A Glance</h2></div>
         <div class="panel-body simple-counts">
           ${simpleCount("Manual review", manualReview.length)}
+          ${simpleCount("PDF uploads", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
           ${simpleCount("Need review", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
         </div>
       </section>
     </div>
-    <div class="notice">Each sync re-checks recent PACER/court emails, records the email received date, reads saved documents, and extracts possible deadlines. Verify every deadline against the docket and rules before relying on it.</div>
+    ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
+    <div class="notice">The dashboard reads court emails every hour, saves anything it can read, and flags what needs a person. Always verify extracted deadlines against the docket and rules before relying on them.</div>
     <div class="layout">
       <div class="stack">
         ${manualReviewSection(manualReview)}
@@ -521,7 +540,7 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
           <div class="panel-head">
             <div><h2>Needs Review</h2><div class="muted">Start here. These are uncertain or missing dates.</div></div>
           </div>
-          ${deadlineTable(needsReview.length ? needsReview : deadlines.slice(0, 10), Boolean(needsReview.length))}
+          ${deadlineTable(needsReview, true)}
         </section>
         <section class="panel">
           <div class="panel-head">
@@ -535,6 +554,7 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
           </div>
           ${noticeTable(notices)}
         </section>
+        ${blockedDocumentSection(blockedDocuments)}
         <section class="panel">
           <div class="panel-head">
             <div><h2>Cases & Documents</h2><div class="muted">Open a case for due dates, notices, saved documents, and uploads.</div></div>
@@ -571,6 +591,28 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
   `;
 }
 
+function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
+  const nextDeadline = deadlines.find((deadline) => deadline.due_at) || deadlines[0];
+  return `<section class="panel start-panel">
+    <div class="panel-head">
+      <div><h2>Start Here</h2><div class="muted">Use this order every time you open the dashboard.</div></div>
+    </div>
+    <div class="steps">
+      ${stepCard("1", "Fix urgent review items", manualReview.length ? `${manualReview.length} item(s) need a person to read them.` : "Nothing urgent is waiting for manual review.", manualReview.length ? "review" : "good")}
+      ${stepCard("2", "Check uncertain dates", needsReview.length ? `${needsReview.length} deadline/date item(s) need verification.` : "No uncertain extracted dates right now.", needsReview.length ? "review" : "good")}
+      ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
+      ${stepCard("4", "Upload full PDFs when needed", blockedDocuments.length ? `${blockedDocuments.length} notice(s) were read from email but still need the full PDF uploaded.` : "No PDF uploads needed right now.", blockedDocuments.length ? "review" : "good")}
+    </div>
+  </section>`;
+}
+
+function stepCard(number, title, body, tone) {
+  return `<div class="step-card ${tone}">
+    <div class="step-number">${number}</div>
+    <div><strong>${escapeHtml(title)}</strong><div class="muted">${body}</div></div>
+  </div>`;
+}
+
 function manualReviewSection(items) {
   if (!items.length) return "";
   return `<section class="panel priority-panel">
@@ -587,6 +629,26 @@ function manualReviewSection(items) {
       ])
     )}
   </section>`;
+}
+
+function blockedDocumentSection(documents) {
+  if (!documents.length) return "";
+  return `<details class="panel">
+    <summary class="panel-head">
+      <div><h2>PDF Uploads Needed</h2><div class="muted">${documents.length} court notice(s) were read, but the full PDF still needs to be uploaded.</div></div>
+      <span class="muted">Open</span>
+    </summary>
+    <div class="section-note">The agent read what was available in the court email. For the full filing, open the document from the original PACER email or docket, download the PDF once, then upload it under the matching case.</div>
+    ${table(
+      ["Received", "Case", "Document", "What the email says / next step"],
+      documents.map((doc) => [
+        `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
+        escapeHtml(doc.case_name || "Case pending review"),
+        `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
+        escapeHtml(doc.document_summary || "PACER did not release the PDF to the server. Upload the PDF under this case after opening it manually.")
+      ])
+    )}
+  </details>`;
 }
 
 async function loadAttorneyContext() {

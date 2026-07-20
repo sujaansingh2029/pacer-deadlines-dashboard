@@ -18,20 +18,27 @@ const DEADLINE_PATTERNS = [
   /\b(?:no later than|on or before|by|due on|set for|scheduled for)\b.{0,120}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi
 ];
 
+const ABSOLUTE_DATE_PATTERN = /\b(?:(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?[,]?\s+)?(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})(?:\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)?)?/gi;
+
+const RELATIVE_DEADLINE_PATTERN = /\b(?:within|no later than|not later than|on or before|before|after)\s+\d{1,3}\s+(?:calendar\s+)?(?:business\s+)?days?\b.{0,160}/gi;
+
 export function looksLikeCourtNotice(email) {
   const haystack = `${email.from}\n${email.subject}\n${email.snippet}\n${email.bodyText}`;
   return NOTICE_PATTERNS.some((pattern) => pattern.test(haystack));
 }
 
 export async function extractNotice(email) {
+  let extraction;
   if (config.openaiApiKey) {
     try {
-      return await extractWithOpenAI(email);
+      extraction = await extractWithOpenAI(email);
+      return addSafetyNetDates(email, extraction);
     } catch (error) {
       console.warn("OpenAI extraction failed; falling back to regex:", error.message);
     }
   }
-  return extractHeuristically(email);
+  extraction = extractHeuristically(email);
+  return addSafetyNetDates(email, extraction);
 }
 
 export async function analyzeDocument(document) {
@@ -193,6 +200,82 @@ function extractHeuristically(email) {
     summary: email.snippet || email.subject,
     deadlines
   });
+}
+
+function addSafetyNetDates(email, extraction) {
+  const body = `${email.subject}\n${email.snippet || ""}\n${email.bodyText || ""}`;
+  const existing = new Set(
+    (extraction.deadlines || []).flatMap((deadline) => [
+      normalizeDateKey(deadline.dateText || deadline.sourceQuote || deadline.label),
+      normalizeDateKey(deadline.dueAt || "")
+    ])
+  );
+  const additions = [];
+
+  for (const match of body.matchAll(ABSOLUTE_DATE_PATTERN)) {
+    const context = contextAround(body, match.index, match[0].length);
+    const parsedDate = parseDate(match[0]);
+    const key = normalizeDateKey(match[0]);
+    const parsedKey = normalizeDateKey(parsedDate || "");
+    if (!key || existing.has(key) || existing.has(parsedKey)) continue;
+    existing.add(key);
+    if (parsedKey) existing.add(parsedKey);
+    additions.push({
+      label: labelForDateContext(context, match[0]),
+      dueAt: parsedDate,
+      dateText: match[0],
+      confidence: "needs_review",
+      sourceQuote: context
+    });
+  }
+
+  for (const match of body.matchAll(RELATIVE_DEADLINE_PATTERN)) {
+    const context = contextAround(body, match.index, match[0].length);
+    const key = normalizeDateKey(match[0]);
+    if (!key || existing.has(key)) continue;
+    existing.add(key);
+    additions.push({
+      label: `Possible relative deadline: ${match[0].slice(0, 100)}`,
+      dueAt: null,
+      dateText: match[0],
+      confidence: "needs_review",
+      sourceQuote: context
+    });
+  }
+
+  return normalizeExtraction({
+    ...extraction,
+    deadlines: [...(extraction.deadlines || []), ...additions]
+  });
+}
+
+function labelForDateContext(context, dateText) {
+  const lower = context.toLowerCase();
+  if (lower.includes("hearing")) return `Possible hearing date: ${dateText}`;
+  if (lower.includes("objection")) return `Possible objection deadline: ${dateText}`;
+  if (lower.includes("response")) return `Possible response deadline: ${dateText}`;
+  if (lower.includes("reply")) return `Possible reply deadline: ${dateText}`;
+  if (lower.includes("conference")) return `Possible conference date: ${dateText}`;
+  if (lower.includes("trial")) return `Possible trial date: ${dateText}`;
+  if (lower.includes("meeting") || lower.includes("341")) return `Possible meeting date: ${dateText}`;
+  if (lower.includes("claim")) return `Possible claim deadline: ${dateText}`;
+  return `Possible court date/deadline: ${dateText}`;
+}
+
+function contextAround(text, index, length) {
+  return String(text || "")
+    .slice(Math.max(0, index - 180), Math.min(text.length, index + length + 220))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 700);
+}
+
+function normalizeDateKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[,.;:]$/g, "")
+    .trim();
 }
 
 function truncateSentence(text) {

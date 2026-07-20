@@ -20,6 +20,22 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      - key: PACER_USERNAME
+        sync: false
+      - key: PACER_PASSWORD
+        sync: false
+      - key: PACER_CLIENT_CODE
+        sync: false
+      - key: PACER_LOGIN_URL
+        sync: false
+      - key: PACER_USERNAME_FIELD
+        sync: false
+      - key: PACER_PASSWORD_FIELD
+        sync: false
+      - key: PACER_CLIENT_CODE_FIELD
+        sync: false
+      - key: PACER_AUTH_COOKIE
+        sync: false
       - key: CRON_SECRET
         generateValue: true
       - key: SESSION_SECRET
@@ -48,6 +64,22 @@ services:
       - key: GOOGLE_CLIENT_SECRET
         sync: false
       - key: OPENAI_API_KEY
+        sync: false
+      - key: PACER_USERNAME
+        sync: false
+      - key: PACER_PASSWORD
+        sync: false
+      - key: PACER_CLIENT_CODE
+        sync: false
+      - key: PACER_LOGIN_URL
+        sync: false
+      - key: PACER_USERNAME_FIELD
+        sync: false
+      - key: PACER_PASSWORD_FIELD
+        sync: false
+      - key: PACER_CLIENT_CODE_FIELD
+        sync: false
+      - key: PACER_AUTH_COOKIE
         sync: false
       - key: CRON_SECRET
         generateValue: true
