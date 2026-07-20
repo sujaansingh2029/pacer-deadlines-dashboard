@@ -86,6 +86,8 @@ export async function initDb() {
       source_type text not null default 'attachment',
       content bytea,
       extracted_text text,
+      document_type text,
+      document_summary text,
       read_status text not null default 'pending',
       created_at timestamptz not null default now(),
       updated_at timestamptz not null default now(),
@@ -111,6 +113,8 @@ export async function initDb() {
     alter table docket_events add column if not exists archived_at timestamptz;
     alter table deadlines add column if not exists archived_at timestamptz;
     alter table documents add column if not exists extracted_text text;
+    alter table documents add column if not exists document_type text;
+    alter table documents add column if not exists document_summary text;
     alter table documents add column if not exists read_status text not null default 'pending';
     alter table documents add column if not exists source_url text;
     alter table documents add column if not exists source_type text not null default 'attachment';

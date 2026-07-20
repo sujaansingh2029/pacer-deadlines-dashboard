@@ -1,6 +1,6 @@
 import { pool } from "./db.js";
-import { extractNotice, looksLikeCourtNotice } from "./extract.js";
-import { gmailForRefreshToken, listIncomingMessages, readMessage } from "./gmail.js";
+import { analyzeDocument, extractNotice, looksLikeCourtNotice } from "./extract.js";
+import { gmailForRefreshToken, listCourtNoticeMessages, listIncomingMessages, readMessage } from "./gmail.js";
 
 export async function syncMailbox(mailbox) {
   const run = await pool.query(
@@ -20,53 +20,34 @@ export async function syncMailbox(mailbox) {
     let notices = 0;
     let deadlineCount = 0;
     let documentCount = 0;
+    const processedIds = new Set();
 
     for (const id of ids.reverse()) {
-      const exists = await pool.query("select 1 from emails where gmail_id = $1", [id]);
-      if (exists.rowCount) continue;
+      const result = await processMessage(gmail, id, mailbox.email, { force: false });
+      processedIds.add(id);
+      scanned += result.scanned;
+      notices += result.notices;
+      deadlineCount += result.deadlineCount;
+      documentCount += result.documentCount;
+    }
 
-      const email = await readMessage(gmail, id);
-      scanned += 1;
-      const isNotice = looksLikeCourtNotice(email);
-      let extraction = null;
-
-      if (isNotice) {
-        extraction = await extractNotice(email);
-        notices += 1;
-      }
-
-      await pool.query(
-        `insert into emails
-          (gmail_id, thread_id, mailbox_email, from_header, to_header, subject, snippet, received_at, body_text, is_court_notice)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         on conflict (gmail_id) do nothing`,
-        [
-          email.id,
-          email.threadId,
-          mailbox.email,
-          email.from,
-          email.to,
-          email.subject,
-          email.snippet,
-          email.receivedAt,
-          email.bodyText,
-          isNotice
-        ]
-      );
-
-      if (isNotice && extraction) {
-        const saved = await saveExtraction(email, extraction);
-        deadlineCount += saved.deadlineCount;
-        documentCount += await saveDocuments(saved.caseId, email);
-      }
+    const auditIds = await listCourtNoticeMessages(gmail, { lookbackDays: 180, maxMessages: 1200 });
+    for (const id of auditIds.reverse()) {
+      if (processedIds.has(id)) continue;
+      const result = await processMessage(gmail, id, mailbox.email, { force: true });
+      scanned += result.scanned;
+      notices += result.notices;
+      deadlineCount += result.deadlineCount;
+      documentCount += result.documentCount;
     }
 
     documentCount += await backfillMissingDocuments(gmail);
     await repairHtmlDocumentReads();
     documentCount += await repairHtmlLinkedDocuments();
+    await backfillDocumentAnalysis();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
-    const summary = `Scanned ${scanned} new message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), downloaded ${documentCount} document(s).`;
+    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).`;
     await pool.query(
       "update sync_runs set finished_at = now(), scanned_count = $1, notice_count = $2, deadline_count = $3, document_count = $4, summary = $5 where id = $6",
       [scanned, notices, deadlineCount, documentCount, summary, runId]
@@ -76,6 +57,96 @@ export async function syncMailbox(mailbox) {
     await pool.query("update sync_runs set finished_at = now(), error = $1 where id = $2", [error.stack || error.message, runId]);
     throw error;
   }
+}
+
+async function processMessage(gmail, id, mailboxEmail, options = {}) {
+  const exists = await pool.query("select 1 from emails where gmail_id = $1", [id]);
+  if (exists.rowCount && !options.force) {
+    return { scanned: 0, notices: 0, deadlineCount: 0, documentCount: 0 };
+  }
+
+  const email = await readMessage(gmail, id);
+  const isNotice = looksLikeCourtNotice(email);
+  await saveEmailRecord(email, mailboxEmail, isNotice);
+  if (!isNotice) {
+    return { scanned: 1, notices: 0, deadlineCount: 0, documentCount: 0 };
+  }
+
+  const initialExtraction = await extractNotice(email);
+  let saved = await replaceExtraction(email, initialExtraction);
+  let documentCount = await saveDocuments(saved.caseId, email);
+
+  const documentText = await loadDocumentTextForEmail(email.id);
+  if (documentText) {
+    const extractionWithDocuments = await extractNotice({
+      ...email,
+      bodyText: `${email.bodyText}\n\n--- SAVED AND READ DOCUMENT TEXT ---\n${documentText}`
+    });
+    saved = await replaceExtraction(email, extractionWithDocuments);
+    await pool.query(
+      "update documents set case_id = $1, updated_at = now() where gmail_id = $2 and source_type <> 'manual_upload'",
+      [saved.caseId, email.id]
+    );
+  }
+
+  return {
+    scanned: 1,
+    notices: 1,
+    deadlineCount: saved.deadlineCount,
+    documentCount
+  };
+}
+
+async function saveEmailRecord(email, mailboxEmail, isNotice) {
+  await pool.query(
+    `insert into emails
+      (gmail_id, thread_id, mailbox_email, from_header, to_header, subject, snippet, received_at, body_text, is_court_notice)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+     on conflict (gmail_id) do update set
+       thread_id = excluded.thread_id,
+       mailbox_email = excluded.mailbox_email,
+       from_header = excluded.from_header,
+       to_header = excluded.to_header,
+       subject = excluded.subject,
+       snippet = excluded.snippet,
+       received_at = excluded.received_at,
+       body_text = excluded.body_text,
+       is_court_notice = excluded.is_court_notice`,
+    [
+      email.id,
+      email.threadId,
+      mailboxEmail,
+      email.from,
+      email.to,
+      email.subject,
+      email.snippet,
+      email.receivedAt,
+      email.bodyText,
+      isNotice
+    ]
+  );
+}
+
+async function replaceExtraction(email, extraction) {
+  await pool.query("delete from deadlines where gmail_id = $1 and status = 'open'", [email.id]);
+  await pool.query("delete from docket_events where gmail_id = $1 and status = 'open'", [email.id]);
+  return await saveExtraction(email, extraction);
+}
+
+async function loadDocumentTextForEmail(gmailId) {
+  const result = await pool.query(
+    `select filename, extracted_text
+     from documents
+     where gmail_id = $1
+       and extracted_text is not null
+     order by created_at desc
+     limit 10`,
+    [gmailId]
+  );
+  return result.rows
+    .map((row) => `Document: ${row.filename}\n${row.extracted_text}`)
+    .join("\n\n")
+    .slice(0, 60000);
 }
 
 async function repairHtmlDocumentReads() {
@@ -94,9 +165,10 @@ async function repairHtmlDocumentReads() {
       mimeType: row.mime_type,
       content: row.content
     });
+    const analysis = await analyzeSavedDocument(row.filename, row.mime_type, extracted);
     await pool.query(
-      "update documents set extracted_text = $1, read_status = $2 where id = $3",
-      [extracted.text, extracted.status, row.id]
+      "update documents set extracted_text = $1, read_status = $2, document_type = $3, document_summary = $4, updated_at = now() where id = $5",
+      [extracted.text, extracted.status, analysis.documentType, analysis.summary, row.id]
     );
   }
 }
@@ -118,9 +190,30 @@ async function repairHtmlLinkedDocuments() {
   let repaired = 0;
   for (const row of result.rows) {
     const doc = await refreshDocumentFromSource(row.id);
-    if (doc?.content && doc?.read_status !== "download_error") repaired += 1;
+    if (doc?.content && !String(doc?.read_status || "").startsWith("download_error:")) repaired += 1;
   }
   return repaired;
+}
+
+async function backfillDocumentAnalysis() {
+  const result = await pool.query(`
+    select id, filename, mime_type, extracted_text, read_status
+    from documents
+    where document_summary is null
+    order by created_at desc
+    limit 150
+  `);
+
+  for (const row of result.rows) {
+    const analysis = await analyzeSavedDocument(row.filename, row.mime_type, {
+      status: row.read_status,
+      text: row.extracted_text
+    });
+    await pool.query(
+      "update documents set document_type = $1, document_summary = $2, updated_at = now() where id = $3",
+      [analysis.documentType, analysis.summary, row.id]
+    );
+  }
 }
 
 export async function refreshDocumentFromSource(documentId) {
@@ -136,6 +229,7 @@ export async function refreshDocumentFromSource(documentId) {
     filename: row.filename || "ECF document.pdf"
   });
   const extracted = await readDocumentText(downloaded);
+  const analysis = await analyzeSavedDocument(downloaded.filename, downloaded.mimeType, extracted);
   const status = downloaded.status === "downloaded" ? extracted.status : downloaded.status;
   const updated = await pool.query(
     `update documents
@@ -145,9 +239,11 @@ export async function refreshDocumentFromSource(documentId) {
          content = $4,
          extracted_text = $5,
          read_status = $6,
+         document_type = $7,
+         document_summary = $8,
          updated_at = now()
-     where id = $7
-     returning filename, mime_type, content, read_status`,
+     where id = $9
+     returning filename, mime_type, content, read_status, document_type, document_summary`,
     [
       downloaded.filename,
       downloaded.mimeType,
@@ -155,10 +251,29 @@ export async function refreshDocumentFromSource(documentId) {
       downloaded.content,
       extracted.text,
       status,
+      analysis.documentType,
+      analysis.summary,
       row.id
     ]
   );
   return updated.rows[0] || null;
+}
+
+async function analyzeSavedDocument(filename, mimeType, extracted) {
+  const readStatus = String(extracted.status || "");
+  if (!extracted.text || readStatus.startsWith("download_error:") || readStatus.startsWith("read_error:") || readStatus === "stored_unreadable") {
+    return {
+      documentType: "Manual review required",
+      summary: readStatus.startsWith("download_error:")
+        ? "The system found a document link, but the court did not return a readable file. Open the PACER notice manually and upload the PDF to this case."
+        : "The document was saved, but the text could not be read clearly. Open it manually and verify any deadlines or hearing dates."
+    };
+  }
+  return await analyzeDocument({
+    filename,
+    mimeType,
+    text: extracted.text
+  });
 }
 
 async function backfillMissingDocuments(gmail) {
@@ -243,10 +358,11 @@ async function saveDocuments(caseId, email) {
   let count = 0;
   for (const attachment of email.attachments || []) {
     const extracted = await readDocumentText(attachment);
+    const analysis = await analyzeSavedDocument(attachment.filename || "document", attachment.mimeType, extracted);
     const result = await pool.query(
       `insert into documents
-        (case_id, gmail_id, filename, mime_type, size_bytes, source_attachment_id, source_type, content, extracted_text, read_status)
-       values ($1,$2,$3,$4,$5,$6,'attachment',$7,$8,$9)
+        (case_id, gmail_id, filename, mime_type, size_bytes, source_attachment_id, source_type, content, extracted_text, read_status, document_type, document_summary)
+       values ($1,$2,$3,$4,$5,$6,'attachment',$7,$8,$9,$10,$11)
        on conflict (gmail_id, filename, size_bytes) do nothing
        returning id`,
       [
@@ -258,7 +374,9 @@ async function saveDocuments(caseId, email) {
         attachment.attachmentId,
         attachment.content,
         extracted.text,
-        extracted.status
+        extracted.status,
+        analysis.documentType,
+        analysis.summary
       ]
     );
     if (result.rowCount) count += 1;
@@ -270,10 +388,11 @@ async function saveDocuments(caseId, email) {
 
     const downloaded = await downloadLinkedDocument(linkedDocument);
     const extracted = await readDocumentText(downloaded);
+    const analysis = await analyzeSavedDocument(downloaded.filename, downloaded.mimeType, extracted);
     const result = await pool.query(
       `insert into documents
-        (case_id, gmail_id, filename, mime_type, size_bytes, source_url, source_type, content, extracted_text, read_status)
-       values ($1,$2,$3,$4,$5,$6,'ecf_link',$7,$8,$9)
+        (case_id, gmail_id, filename, mime_type, size_bytes, source_url, source_type, content, extracted_text, read_status, document_type, document_summary)
+       values ($1,$2,$3,$4,$5,$6,'ecf_link',$7,$8,$9,$10,$11)
        on conflict do nothing
        returning id`,
       [
@@ -285,7 +404,9 @@ async function saveDocuments(caseId, email) {
         linkedDocument.url,
         downloaded.content,
         extracted.text,
-        downloaded.status === "downloaded" ? extracted.status : downloaded.status
+        downloaded.status === "downloaded" ? extracted.status : downloaded.status,
+        analysis.documentType,
+        analysis.summary
       ]
     );
     if (result.rowCount) count += 1;

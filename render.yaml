@@ -33,7 +33,7 @@ services:
     plan: starter
     buildCommand: npm install
     startCommand: npm run sync
-    schedule: "0 13,16,19 * * *"
+    schedule: "0 * * * *"
     envVars:
       - key: NODE_VERSION
         value: 20

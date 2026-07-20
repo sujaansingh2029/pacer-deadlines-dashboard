@@ -34,9 +34,22 @@ export function gmailForRefreshToken(refreshToken) {
   return google.gmail({ version: "v1", auth: client });
 }
 
-export async function listIncomingMessages(gmail, afterUnixSeconds) {
-  const after = afterUnixSeconds ? ` after:${afterUnixSeconds}` : " newer_than:30d";
+export async function listIncomingMessages(gmail, afterUnixSeconds, options = {}) {
+  const lookbackDays = options.lookbackDays || 180;
+  const maxMessages = options.maxMessages || 1000;
+  const after = afterUnixSeconds ? ` after:${afterUnixSeconds}` : ` newer_than:${lookbackDays}d`;
   const q = `in:anywhere -in:spam -in:trash -in:sent -in:drafts${after}`;
+  return listMessagesByQuery(gmail, q, maxMessages);
+}
+
+export async function listCourtNoticeMessages(gmail, options = {}) {
+  const lookbackDays = options.lookbackDays || 180;
+  const maxMessages = options.maxMessages || 1200;
+  const q = `in:anywhere -in:spam -in:trash -in:sent -in:drafts newer_than:${lookbackDays}d {pacer cm/ecf uscourts.gov "Notice of Electronic Filing" docket}`;
+  return listMessagesByQuery(gmail, q, maxMessages);
+}
+
+async function listMessagesByQuery(gmail, q, maxMessages) {
   const ids = [];
   let pageToken;
 
@@ -49,7 +62,7 @@ export async function listIncomingMessages(gmail, afterUnixSeconds) {
     });
     for (const message of result.data.messages || []) ids.push(message.id);
     pageToken = result.data.nextPageToken;
-  } while (pageToken && ids.length < 500);
+  } while (pageToken && ids.length < maxMessages);
 
   return ids;
 }

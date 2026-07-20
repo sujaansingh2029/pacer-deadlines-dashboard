@@ -5,6 +5,7 @@ import multer from "multer";
 import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
 import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
+import { analyzeDocument } from "./extract.js";
 import { authUrl, exchangeCode } from "./gmail.js";
 import { readDocumentText, refreshDocumentFromSource, syncMailbox } from "./sync.js";
 
@@ -49,7 +50,7 @@ app.get("/", async (_req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  const [deadlines, needsReview, events, cases, documents, runs, stats] = await Promise.all([
+  const [deadlines, needsReview, events, cases, documents, notices, manualReview, runs, stats] = await Promise.all([
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
@@ -70,7 +71,7 @@ app.get("/", async (_req, res) => {
       limit 25
     `),
     pool.query(`
-      select de.*, c.case_name, c.court, c.case_number, e.subject
+      select de.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from docket_events de
       join cases c on c.id = de.case_id
       join emails e on e.gmail_id = de.gmail_id
@@ -84,22 +85,71 @@ app.get("/", async (_req, res) => {
         min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
         count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
         count(distinct de.id) filter (where de.status = 'open') as open_event_count,
-        max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at
+        max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at,
+        max(e.received_at) as latest_notice_received_at
       from cases c
       left join deadlines d on d.case_id = c.id
       left join docket_events de on de.case_id = c.id
       left join documents doc on doc.case_id = c.id
+      left join emails e on e.gmail_id = de.gmail_id or e.gmail_id = d.gmail_id or e.gmail_id = doc.gmail_id
       group by c.id
       order by next_deadline_at nulls last, latest_activity_at desc nulls last
       limit 30
     `),
     pool.query(`
       select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
-             doc.source_url, doc.source_type, doc.extracted_text, doc.created_at, e.subject, e.received_at
+             doc.source_url, doc.source_type, doc.extracted_text, doc.document_type, doc.document_summary,
+             doc.created_at, e.subject, e.received_at
       from documents doc
       left join emails e on e.gmail_id = doc.gmail_id
       order by doc.created_at desc
       limit 200
+    `),
+    pool.query(`
+      select e.gmail_id, e.from_header, e.subject, e.received_at, e.is_court_notice,
+             count(distinct d.id) filter (where d.status = 'open') as open_deadlines,
+             count(distinct de.id) filter (where de.status = 'open') as open_activity,
+             count(distinct doc.id) as documents
+      from emails e
+      left join deadlines d on d.gmail_id = e.gmail_id
+      left join docket_events de on de.gmail_id = e.gmail_id
+      left join documents doc on doc.gmail_id = e.gmail_id
+      where e.is_court_notice = true
+      group by e.gmail_id
+      order by e.received_at desc nulls last
+      limit 75
+    `),
+    pool.query(`
+      select *
+      from (
+        select 'Email' as item_type, e.gmail_id as item_id, e.subject as title, e.from_header as detail,
+               e.received_at, e.snippet as reason
+        from emails e
+        left join deadlines d on d.gmail_id = e.gmail_id and d.status = 'open'
+        left join docket_events de on de.gmail_id = e.gmail_id and de.status = 'open'
+        left join cases c on c.id = de.case_id or c.id = d.case_id
+        where e.is_court_notice = true
+        group by e.gmail_id
+        having count(distinct d.id) = 0
+           and (
+             count(distinct de.id) = 0
+             or count(distinct c.id) filter (where c.case_name is not null or c.case_number is not null) = 0
+           )
+        union all
+        select 'Document' as item_type, doc.id::text as item_id, doc.filename as title,
+               coalesce(c.case_name, 'Case pending review') as detail,
+               coalesce(e.received_at, doc.created_at) as received_at,
+               coalesce(doc.document_summary, doc.read_status, 'Document needs manual review') as reason
+        from documents doc
+        left join cases c on c.id = doc.case_id
+        left join emails e on e.gmail_id = doc.gmail_id
+        where doc.read_status like 'download_error:%'
+           or doc.read_status like 'read_error:%'
+           or doc.read_status = 'stored_unreadable'
+           or doc.document_type = 'Manual review required'
+      ) review_items
+      order by review_items.received_at desc nulls last
+      limit 75
     `),
     pool.query("select * from sync_runs order by started_at desc limit 5"),
     pool.query(`
@@ -119,6 +169,8 @@ app.get("/", async (_req, res) => {
     events: events.rows,
     cases: cases.rows,
     documents: documents.rows,
+    notices: notices.rows,
+    manualReview: manualReview.rows,
     runs: runs.rows,
     stats: stats.rows[0]
   })));
@@ -177,10 +229,16 @@ app.post("/cases/:id/documents", upload.single("document"), async (req, res) => 
     content: req.file.buffer
   };
   const extracted = await readDocumentText(attachment);
+  const analysis = extracted.text
+    ? await analyzeDocument({ filename: attachment.filename, mimeType: attachment.mimeType, text: extracted.text })
+    : {
+        documentType: "Manual review required",
+        summary: "The uploaded file was saved, but the text could not be read clearly. Review the document manually."
+      };
   await pool.query(
     `insert into documents
-      (case_id, filename, mime_type, size_bytes, source_type, content, extracted_text, read_status)
-     values ($1,$2,$3,$4,'manual_upload',$5,$6,$7)`,
+      (case_id, filename, mime_type, size_bytes, source_type, content, extracted_text, read_status, document_type, document_summary)
+     values ($1,$2,$3,$4,'manual_upload',$5,$6,$7,$8,$9)`,
     [
       caseId,
       attachment.filename,
@@ -188,7 +246,9 @@ app.post("/cases/:id/documents", upload.single("document"), async (req, res) => 
       attachment.size,
       attachment.content,
       extracted.text,
-      extracted.status
+      extracted.status,
+      analysis.documentType,
+      analysis.summary
     ]
   );
   res.redirect(req.get("referer") || "/");
@@ -314,6 +374,7 @@ function layout(title, body) {
     body { margin: 0; background: var(--soft); color: var(--ink); }
     header { background: #ffffff; border-bottom: 1px solid var(--line); padding: 18px 28px; display: flex; align-items: center; justify-content: space-between; gap: 16px; position: sticky; top: 0; z-index: 2; }
     main { max-width: 1360px; margin: 0 auto; padding: 22px; }
+    * { overflow-wrap: anywhere; }
     h1 { font-size: 22px; margin: 0; letter-spacing: 0; }
     h2 { font-size: 15px; margin: 0; letter-spacing: 0; }
     .muted { color: var(--muted); font-size: 13px; }
@@ -325,6 +386,8 @@ function layout(title, body) {
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
     .stack { display: grid; gap: 16px; }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .priority-panel { border-color: #f79009; box-shadow: 0 0 0 1px rgba(247, 144, 9, .14); }
+    .priority-panel .panel-head { background: #fffbeb; }
     .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .panel-body { padding: 10px 14px; }
     .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
@@ -337,7 +400,7 @@ function layout(title, body) {
     details.panel summary { list-style: none; cursor: pointer; }
     details.panel summary::-webkit-details-marker { display: none; }
     .section-note { padding: 10px 14px; border-bottom: 1px solid #edf0f5; color: var(--muted); font-size: 13px; }
-    table { width: 100%; border-collapse: collapse; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid #edf0f5; vertical-align: top; font-size: 13px; }
     th { background: #f8fafc; color: #475467; font-weight: 800; }
     tr:last-child td { border-bottom: 0; }
@@ -346,7 +409,7 @@ function layout(title, body) {
     .tag { display: inline-block; background: #e7f0ff; color: #1849a9; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 800; white-space: nowrap; }
     .tag.review { background:#fff1d6; color:#93370d; }
     .tag.high { background:#dcfae6; color:#05603a; }
-    .case-title { font-weight: 800; }
+    .case-title { font-weight: 800; font-size: 15px; line-height: 1.3; }
     .due { font-weight: 800; white-space: nowrap; }
     .empty { padding: 18px; color: var(--muted); }
     .check-form { margin: 0; }
@@ -365,6 +428,7 @@ function layout(title, body) {
     .document-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #fbfcfe; }
     .document-name { font-weight: 800; overflow-wrap: anywhere; }
     .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
+    .document-summary { font-size: 13px; margin-top: 5px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
     .document-actions { display: flex; gap: 10px; align-items: center; }
     .upload-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border: 1px dashed #b8c7e6; border-radius: 8px; padding: 8px; background: #f8fbff; }
@@ -387,7 +451,7 @@ function layout(title, body) {
   <header>
     <div>
       <h1>${escapeHtml(title)}</h1>
-      <div class="muted">Court notice monitoring, active-case deadlines, and attorney review queue</div>
+      <div class="muted">Simple court notice review, deadlines, documents, and active cases</div>
     </div>
   </header>
   <main>${body}</main>
@@ -420,7 +484,7 @@ function loginHtml(hasError) {
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, runs, stats }) {
+function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, notices, manualReview, runs, stats }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
@@ -442,30 +506,38 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
       <section class="panel">
         <div class="panel-head"><h2>At A Glance</h2></div>
         <div class="panel-body simple-counts">
+          ${simpleCount("Manual review", manualReview.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
           ${simpleCount("Need review", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
         </div>
       </section>
     </div>
-    <div class="notice">Deadlines are extracted from email notices and must be verified against the docket and applicable rules before anyone relies on them.</div>
+    <div class="notice">Each sync re-checks recent PACER/court emails, records the email received date, reads saved documents, and extracts possible deadlines. Verify every deadline against the docket and rules before relying on it.</div>
     <div class="layout">
       <div class="stack">
+        ${manualReviewSection(manualReview)}
         <section class="panel">
           <div class="panel-head">
-            <div><h2>What Needs Attention</h2><div class="muted">Review these first, then check them off when handled</div></div>
+            <div><h2>Needs Review</h2><div class="muted">Start here. These are uncertain or missing dates.</div></div>
           </div>
           ${deadlineTable(needsReview.length ? needsReview : deadlines.slice(0, 10), Boolean(needsReview.length))}
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Upcoming Deadlines</h2><div class="muted">Simple date-ordered list</div></div>
+            <div><h2>Deadline Calendar</h2><div class="muted">Date ordered, with the email received date shown for every item.</div></div>
           </div>
           ${deadlineTable(deadlines, false)}
         </section>
         <section class="panel">
           <div class="panel-head">
-            <div><h2>Active Cases & Documents</h2><div class="muted">Open a case to see saved documents and upload PDFs when PACER blocks a link</div></div>
+            <div><h2>Court Notices Reviewed</h2><div class="muted">Every PACER/court email the dashboard reviewed recently.</div></div>
+          </div>
+          ${noticeTable(notices)}
+        </section>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Cases & Documents</h2><div class="muted">Open a case for due dates, notices, saved documents, and uploads.</div></div>
           </div>
           <div class="panel-body">${caseCards(cases, documents, deadlines)}</div>
         </section>
@@ -497,6 +569,24 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
       </div>
     </div>
   `;
+}
+
+function manualReviewSection(items) {
+  if (!items.length) return "";
+  return `<section class="panel priority-panel">
+    <div class="panel-head">
+      <div><h2>Manual Review Required</h2><div class="muted">These items could not be safely understood by the system. Review them before relying on the dashboard.</div></div>
+    </div>
+    ${table(
+      ["Received", "Type", "Item", "Reason"],
+      items.map((item) => [
+        `<span class="due">${formatDate(item.received_at) || "Review date pending"}</span>`,
+        `<span class="tag review">${escapeHtml(item.item_type)}</span>`,
+        `<strong>${escapeHtml(item.title || "Review item")}</strong><br><span class="muted">${escapeHtml(item.detail || "")}</span>`,
+        escapeHtml(item.reason || "Review this item manually.")
+      ])
+    )}
+  </section>`;
 }
 
 async function loadAttorneyContext() {
@@ -538,7 +628,8 @@ async function loadAttorneyContext() {
 
   const documents = await pool.query(`
     select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
-           doc.source_url, doc.source_type, left(doc.extracted_text, 2500) as extracted_text, c.case_name, c.court, c.case_number
+           doc.source_url, doc.source_type, doc.document_type, doc.document_summary,
+           left(doc.extracted_text, 2500) as extracted_text, c.case_name, c.court, c.case_number
     from documents doc
     join cases c on c.id = doc.case_id
     order by doc.created_at desc
@@ -574,21 +665,21 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
   }
 
   if (nextDeadline) {
-    items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Unknown case")} - ${escapeHtml(nextDeadline.label)}.`);
+    items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Case pending review")} - ${escapeHtml(nextDeadline.label)}.`);
   } else {
     items.push("No open deadlines have been extracted yet.");
   }
 
   if (nextCase) {
-    items.push(`Next active case to watch: ${escapeHtml(nextCase.case_name || "Unknown case")} ${nextCase.next_deadline_at ? `on ${formatDate(nextCase.next_deadline_at)}` : "with no parsed deadline yet"}.`);
+    items.push(`Next active case to watch: ${escapeHtml(nextCase.case_name || "Case pending review")} ${nextCase.next_deadline_at ? `on ${formatDate(nextCase.next_deadline_at)}` : "with no parsed deadline yet"}.`);
   }
 
   if (latestEvent) {
-    items.push(`Latest court activity: ${escapeHtml(latestEvent.event_title || latestEvent.subject || "Court notice")} received ${formatDate(latestEvent.source_received_at)}.`);
+    items.push(`Latest court email received: ${formatDate(latestEvent.received_at || latestEvent.source_received_at) || "Review date pending"} - ${escapeHtml(latestEvent.event_title || latestEvent.subject || "Court notice")}.`);
   }
 
   if (Number(stats.documents || 0) > 0) {
-    items.push(`${Number(stats.documents)} document(s) have been downloaded and grouped under their cases.`);
+    items.push(`${Number(stats.documents)} document(s) have been saved and grouped under their cases.`);
   }
 
   return `<ul class="summary-list">${items.map((item) => `<li>${item}</li>`).join("")}</ul>`;
@@ -649,13 +740,40 @@ function chatPanel() {
   `;
 }
 
+function noticeTable(notices) {
+  if (!notices.length) return `<div class="empty">No court notices have been reviewed yet. Run Sync Now after connecting Gmail.</div>`;
+  return table(
+    ["Email Received", "Notice", "What Was Found", "Status"],
+    notices.map((notice) => {
+      const deadlineCount = Number(notice.open_deadlines || 0);
+      const activityCount = Number(notice.open_activity || 0);
+      const documentCount = Number(notice.documents || 0);
+      const found = [
+        `${deadlineCount} deadline${deadlineCount === 1 ? "" : "s"}`,
+        `${activityCount} activity item${activityCount === 1 ? "" : "s"}`,
+        `${documentCount} document${documentCount === 1 ? "" : "s"}`
+      ].join("<br>");
+      const status = deadlineCount || activityCount || documentCount
+        ? `<span class="tag high">reviewed</span>`
+        : `<span class="tag review">review needed</span>`;
+      return [
+        `<span class="due">${formatDate(notice.received_at) || "Review date pending"}</span>`,
+        `<strong>${escapeHtml(notice.subject || "Court notice")}</strong><br><span class="muted">${escapeHtml(notice.from_header || "")}</span>`,
+        found,
+        status
+      ];
+    })
+  );
+}
+
 function deadlineTable(deadlines, compact) {
   if (!deadlines.length) return `<div class="empty">No open items here.</div>`;
   return table(
-    ["Done", "Due", "Case", "Deadline", "Confidence", compact ? "Why review" : "Source"],
+    ["Done", "Due", "Email Received", "Case", "Deadline", "Confidence", compact ? "Why review" : "Source"],
     deadlines.map((d) => [
       archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline"),
       `<span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review")}</span>`,
+      formatDate(d.received_at) || "Review date pending",
       caseLabel(d),
       `<strong>${escapeHtml(d.label)}</strong>${d.source_quote ? `<br><span class="muted">${escapeHtml(d.source_quote)}</span>` : ""}`,
       confidenceTag(d.confidence),
@@ -672,7 +790,7 @@ function activityList(events) {
       <div>
         <div class="activity-title">${escapeHtml(e.event_title || e.subject || "Court notice")}</div>
         <div>${caseLabel(e)}</div>
-        <div class="muted">${formatDate(e.source_received_at)}${e.docket_number ? ` · Docket ${escapeHtml(e.docket_number)}` : ""}${e.filing_party ? ` · Filed by ${escapeHtml(e.filing_party)}` : ""}</div>
+        <div class="muted">Email received: ${formatDate(e.received_at || e.source_received_at) || "Review date pending"}${e.docket_number ? ` · Docket ${escapeHtml(e.docket_number)}` : ""}${e.filing_party ? ` · Filed by ${escapeHtml(e.filing_party)}` : ""}</div>
         ${e.summary ? `<div style="margin-top:6px">${escapeHtml(e.summary)}</div>` : ""}
       </div>
     </div>`).join("")}</div>`;
@@ -696,7 +814,7 @@ function caseCards(cases, documents, deadlines) {
   return `<div class="small-list">${cases.map((c) => `
     <details class="case-card">
       <summary>
-        <div class="case-title">${escapeHtml(c.case_name || "Unknown case")}</div>
+        <div class="case-title">${escapeHtml(c.case_name || "Case pending review")}</div>
         <div class="muted">${escapeHtml([c.court, c.case_number].filter(Boolean).join(" | ") || "Court/case number pending")}</div>
         <div class="case-meta">
           ${c.next_deadline_at ? `<span class="tag">Next: ${formatDate(c.next_deadline_at)}</span>` : `<span class="tag review">No parsed deadline</span>`}
@@ -706,7 +824,7 @@ function caseCards(cases, documents, deadlines) {
         </div>
       </summary>
       ${c.judge ? `<div class="muted" style="margin-top:8px">Judge: ${escapeHtml(c.judge)}</div>` : ""}
-      ${c.latest_activity_at ? `<div class="muted" style="margin-top:4px">Latest activity: ${formatDate(c.latest_activity_at)}</div>` : ""}
+      ${c.latest_notice_received_at ? `<div class="muted" style="margin-top:4px">Latest notice received: ${formatDate(c.latest_notice_received_at)}</div>` : ""}
       ${caseDeadlineList(deadlinesByCase.get(c.id) || [])}
       ${documentList(c.id, docsByCase.get(c.id) || [])}
     </details>
@@ -723,7 +841,7 @@ function caseDeadlineList(deadlines) {
     ${deadlines.map((deadline) => `
       <div class="case-deadline-row">
         <div>${archiveButton(`/deadlines/${deadline.id}/archive`, "Archive deadline")}</div>
-        <div><span class="due">${formatDate(deadline.due_at) || escapeHtml(deadline.date_text || "Needs review")}</span><br>${confidenceTag(deadline.confidence)}</div>
+        <div><span class="due">${formatDate(deadline.due_at) || escapeHtml(deadline.date_text || "Needs review")}</span><br>${confidenceTag(deadline.confidence)}<br><span class="muted">Email: ${formatDate(deadline.received_at) || "Review date pending"}</span></div>
         <div><strong>${escapeHtml(deadline.label)}</strong>${deadline.source_quote ? `<br><span class="muted">${escapeHtml(deadline.source_quote)}</span>` : ""}<br><span class="muted">${escapeHtml(deadline.subject || "")}</span></div>
       </div>
     `).join("")}
@@ -743,7 +861,9 @@ function documentList(caseId, documents) {
     <div class="document-row">
       <div>
         <div class="document-name">${escapeHtml(doc.filename)}</div>
-        <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}</div>
+        ${doc.document_type ? `<div><span class="tag">${escapeHtml(doc.document_type)}</span></div>` : ""}
+        <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}${doc.received_at ? ` · Email received: ${formatDate(doc.received_at)}` : ""}</div>
+        ${doc.document_summary ? `<div class="document-summary">${escapeHtml(doc.document_summary)}</div>` : ""}
         ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
       </div>
       <div class="document-actions">
@@ -778,7 +898,7 @@ function table(headers, rows) {
 }
 
 function caseLabel(row) {
-  return `${escapeHtml(row.case_name || "Unknown case")}<br><span class="muted">${escapeHtml([row.court, row.case_number].filter(Boolean).join(" | "))}</span>`;
+  return `${escapeHtml(row.case_name || "Case pending review")}<br><span class="muted">${escapeHtml([row.court, row.case_number].filter(Boolean).join(" | "))}</span>`;
 }
 
 function formatDate(value) {
@@ -792,7 +912,7 @@ function formatDate(value) {
 
 function formatBytes(value) {
   const bytes = Number(value || 0);
-  if (!bytes) return "unknown size";
+  if (!bytes) return "size pending";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
