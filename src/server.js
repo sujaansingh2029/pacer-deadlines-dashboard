@@ -138,12 +138,19 @@ app.get("/", async (_req, res) => {
       select *
       from (
         select 'Email' as item_type, e.gmail_id as item_id, e.subject as title, e.from_header as detail,
-               e.received_at, e.snippet as reason
+               e.received_at,
+               'The system did not find a clear case, docket event, or deadline in this court notice. Open the email if this item still matters; otherwise check it off.' as reason
         from emails e
         left join deadlines d on d.gmail_id = e.gmail_id and d.status = 'open'
         left join docket_events de on de.gmail_id = e.gmail_id and de.status = 'open'
         left join cases c on c.id = de.case_id or c.id = d.case_id
         where e.is_court_notice = true
+          and coalesce(e.review_status, 'open') = 'open'
+          and not (
+            lower(coalesce(e.from_header, '')) like '%accounts.google.com%'
+            or lower(coalesce(e.subject, '')) like '%security alert%'
+            or lower(coalesce(e.subject, '')) like '%new sign-in%'
+          )
         group by e.gmail_id
         having count(distinct d.id) = 0
            and (
@@ -158,9 +165,12 @@ app.get("/", async (_req, res) => {
         from documents doc
         left join cases c on c.id = doc.case_id
         left join emails e on e.gmail_id = doc.gmail_id
-        where doc.read_status like 'read_error:%'
-           or doc.read_status = 'stored_unreadable'
-           or (doc.document_type = 'Manual review required' and coalesce(doc.read_status, '') not like 'download_error:%')
+        where coalesce(doc.review_status, 'open') = 'open'
+          and (
+            doc.read_status like 'read_error:%'
+            or doc.read_status = 'stored_unreadable'
+            or (doc.document_type = 'Manual review required' and coalesce(doc.read_status, '') not like 'download_error:%')
+          )
       ) review_items
       order by review_items.received_at desc nulls last
       limit 75
@@ -172,8 +182,11 @@ app.get("/", async (_req, res) => {
       from documents doc
       left join cases c on c.id = doc.case_id
       left join emails e on e.gmail_id = doc.gmail_id
-      where doc.read_status like 'download_error:%'
-         or doc.read_status = 'notice_read_pdf_blocked'
+      where coalesce(doc.review_status, 'open') = 'open'
+        and (
+          doc.read_status like 'download_error:%'
+          or doc.read_status = 'notice_read_pdf_blocked'
+        )
       order by coalesce(e.received_at, doc.created_at) desc
       limit 100
     `),
@@ -190,7 +203,7 @@ app.get("/", async (_req, res) => {
         (select count(*) from documents) as documents,
         (select count(*) from documents where read_status = 'read') as read_documents,
         (select count(*) from documents where read_status <> 'read') as unread_documents,
-        ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open')) as history_items
+        ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open') + (select count(*) from emails where coalesce(review_status, 'open') <> 'open') + (select count(*) from documents where coalesce(review_status, 'open') <> 'open')) as history_items
     `)
   ]);
 
@@ -215,8 +228,8 @@ app.get("/", async (_req, res) => {
 
 function loadHistoryItems() {
   return pool.query(`
-    select *
-    from (
+      select *
+      from (
       select 'Deadline' as item_type,
              d.id::text as item_id,
              d.status,
@@ -248,6 +261,37 @@ function loadHistoryItems() {
       join cases c on c.id = de.case_id
       left join emails e on e.gmail_id = de.gmail_id
       where de.status <> 'open'
+      union all
+      select 'Email Review' as item_type,
+             e.gmail_id as item_id,
+             coalesce(e.review_status, 'history') as status,
+             e.archived_at,
+             e.processed_at as created_at,
+             e.received_at as item_date,
+             e.received_at,
+             coalesce(e.subject, 'Court notice review') as title,
+             'No case assigned' as case_name,
+             '' as case_number,
+             coalesce(e.from_header, '') as detail
+      from emails e
+      where e.is_court_notice = true
+        and coalesce(e.review_status, 'open') <> 'open'
+      union all
+      select 'Document' as item_type,
+             doc.id::text as item_id,
+             coalesce(doc.review_status, 'history') as status,
+             doc.archived_at,
+             doc.created_at,
+             coalesce(e.received_at, doc.created_at) as item_date,
+             coalesce(e.received_at, doc.created_at) as received_at,
+             doc.filename as title,
+             coalesce(c.case_name, 'Case pending review') as case_name,
+             coalesce(c.case_number, '') as case_number,
+             coalesce(doc.document_summary, doc.read_status, '') as detail
+      from documents doc
+      left join cases c on c.id = doc.case_id
+      left join emails e on e.gmail_id = doc.gmail_id
+      where coalesce(doc.review_status, 'open') <> 'open'
     ) history
     order by coalesce(history.archived_at, history.item_date, history.created_at) desc
     limit 150
@@ -309,6 +353,16 @@ app.post("/deadlines/:id/archive", async (req, res) => {
 
 app.post("/events/:id/archive", async (req, res) => {
   await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
+  res.redirect(req.get("referer") || "/");
+});
+
+app.post("/emails/:id/archive", async (req, res) => {
+  await pool.query("update emails set review_status = 'archived', archived_at = now() where gmail_id = $1", [req.params.id]);
+  res.redirect(req.get("referer") || "/");
+});
+
+app.post("/documents/:id/archive", async (req, res) => {
+  await pool.query("update documents set review_status = 'archived', archived_at = now(), updated_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
 });
 
@@ -586,12 +640,18 @@ function layout(title, body) {
     details.case-card summary::-webkit-details-marker { display: none; }
     .case-meta { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
     .document-list { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
-    .document-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #fbfcfe; }
+    .document-row { border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #fbfcfe; }
+    .document-row-main { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: start; }
     .document-name { font-weight: 800; overflow-wrap: anywhere; }
     .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
     .document-summary { font-size: 13px; margin-top: 5px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
     .document-actions { display: flex; gap: 10px; align-items: center; }
+    .document-viewer { margin-top: 10px; border-top: 1px solid #edf0f5; padding-top: 10px; }
+    .document-viewer summary { cursor: pointer; color: var(--blue); font-weight: 900; font-size: 12px; list-style: none; }
+    .document-viewer summary::-webkit-details-marker { display: none; }
+    .pdf-frame { width: 100%; height: min(72vh, 760px); border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; margin-top: 8px; }
+    .document-unavailable { margin-top: 10px; border-top: 1px solid #edf0f5; padding-top: 8px; color: var(--muted); font-size: 12px; }
     .upload-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border: 1px dashed #b8c7e6; border-radius: 8px; padding: 8px; background: #f8fbff; }
     .upload-form input { max-width: 280px; font-size: 12px; color: var(--muted); }
     .upload-form button { padding: 7px 10px; font-size: 12px; }
@@ -773,15 +833,21 @@ function dueBucket(title, items, tone, emptyText) {
 
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
   const nextDeadline = deadlines.find((deadline) => deadline.due_at) || deadlines[0];
+  const reviewText = manualReview.length
+    ? `${manualReview.length} active item(s). Check off anything already handled.`
+    : "Nothing urgent is waiting for manual review.";
+  const pdfText = blockedDocuments.length
+    ? `${blockedDocuments.length} active PDF request(s). Upload the PDF or check off if not needed.`
+    : "No PDF uploads needed right now.";
   return `<section class="panel start-panel">
     <div class="panel-head">
       <div><h2>Start Here</h2><div class="muted">Use this order every time you open the dashboard.</div></div>
     </div>
     <div class="steps">
-      ${stepCard("1", "Fix urgent review items", manualReview.length ? `${manualReview.length} item(s) need a person to read them.` : "Nothing urgent is waiting for manual review.", manualReview.length ? "review" : "good")}
+      ${stepCard("1", "Fix urgent review items", reviewText, manualReview.length ? "review" : "good")}
       ${stepCard("2", "Check uncertain dates", needsReview.length ? `${needsReview.length} deadline/date item(s) need verification.` : "No uncertain extracted dates right now.", needsReview.length ? "review" : "good")}
       ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
-      ${stepCard("4", "Upload full PDFs when needed", blockedDocuments.length ? `${blockedDocuments.length} notice(s) were read from email but still need the full PDF uploaded.` : "No PDF uploads needed right now.", blockedDocuments.length ? "review" : "good")}
+      ${stepCard("4", "Upload full PDFs when needed", pdfText, blockedDocuments.length ? "review" : "good")}
     </div>
   </section>`;
 }
@@ -800,8 +866,11 @@ function manualReviewSection(items) {
       <div><h2>Manual Review Required</h2><div class="muted">These items could not be safely understood by the system. Review them before relying on the dashboard.</div></div>
     </div>
     ${table(
-      ["Received", "Type", "Item", "Reason"],
+      ["Done", "Received", "Type", "Item", "Reason"],
       items.map((item) => [
+        item.item_type === "Email"
+          ? archiveButton(`/emails/${item.item_id}/archive`, "Move email review to history")
+          : "",
         `<span class="due">${formatDate(item.received_at) || "Review date pending"}</span>`,
         `<span class="tag review">${escapeHtml(item.item_type)}</span>`,
         `<strong>${escapeHtml(item.title || "Review item")}</strong><br><span class="muted">${escapeHtml(item.detail || "")}</span>`,
@@ -820,8 +889,9 @@ function blockedDocumentSection(documents) {
     </summary>
     <div class="section-note">The agent read what was available in the court email. For the full filing, open the document from the original PACER email or docket, download the PDF once, then upload it under the matching case.</div>
     ${table(
-      ["Received", "Case", "Document", "What the email says / next step"],
+      ["Done", "Received", "Case", "Document", "What the email says / next step"],
       documents.map((doc) => [
+        archiveButton(`/documents/${doc.id}/archive`, "Move document request to history"),
         `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
         escapeHtml(doc.case_name || "Case pending review"),
         `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
@@ -1140,19 +1210,43 @@ function documentList(caseId, documents) {
   }
   return `<div class="document-list"><div class="case-section-title">Documents</div>${uploadForm}${documents.map((doc) => `
     <div class="document-row">
-      <div>
-        <div class="document-name">${escapeHtml(doc.filename)}</div>
-        ${doc.document_type ? `<div><span class="tag">${escapeHtml(doc.document_type)}</span></div>` : ""}
-        <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}${doc.received_at ? ` · Email received: ${formatDate(doc.received_at)}` : ""}</div>
-        ${doc.document_summary ? `<div class="document-summary">${escapeHtml(doc.document_summary)}</div>` : ""}
-        ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
+      <div class="document-row-main">
+        <div>
+          <div class="document-name">${escapeHtml(doc.filename)}</div>
+          ${doc.document_type ? `<div><span class="tag">${escapeHtml(doc.document_type)}</span></div>` : ""}
+          <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}${doc.received_at ? ` · Email received: ${formatDate(doc.received_at)}` : ""}</div>
+          ${doc.document_summary ? `<div class="document-summary">${escapeHtml(doc.document_summary)}</div>` : ""}
+          ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
+        </div>
+        <div class="document-actions">
+          <a class="document-link" href="/documents/${doc.id}/view" target="_blank" rel="noopener">Open</a>
+          <a class="document-link" href="/documents/${doc.id}/download">Download</a>
+        </div>
       </div>
-      <div class="document-actions">
-        <a class="document-link" href="/documents/${doc.id}/view" target="_blank" rel="noopener">View</a>
-        <a class="document-link" href="/documents/${doc.id}/download">Download</a>
-      </div>
+      ${documentInlineViewer(doc)}
     </div>
   `).join("")}</div>`;
+}
+
+function documentInlineViewer(doc) {
+  if (isInlinePdf(doc)) {
+    return `<details class="document-viewer">
+      <summary>Preview PDF in dashboard</summary>
+      <iframe class="pdf-frame" src="/documents/${doc.id}/view#toolbar=1&navpanes=0" title="${escapeHtml(doc.filename || "PDF document")}"></iframe>
+    </details>`;
+  }
+
+  if (String(doc.read_status || "") === "read") {
+    return `<div class="document-unavailable">This document was read by the system, but it is not a PDF preview. Use Open or Download if you need the original file.</div>`;
+  }
+
+  return `<div class="document-unavailable">PDF preview will appear here after the document is downloaded and saved as a PDF.</div>`;
+}
+
+function isInlinePdf(doc) {
+  const mimeType = String(doc.mime_type || "").toLowerCase();
+  const filename = String(doc.filename || "").toLowerCase();
+  return String(doc.read_status || "") === "read" && (mimeType.includes("pdf") || filename.endsWith(".pdf"));
 }
 
 function sourceLabel(sourceType) {

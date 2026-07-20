@@ -48,6 +48,7 @@ Deadline extraction is assistive only. Every legal deadline should be checked ag
    - `PACER_CLIENT_CODE` optional, if your PACER account requires one
    - `PACER_LOGIN_URL` optional, defaults to `https://pacer.login.uscourts.gov/csologin/login.jsf`
    - `PACER_AUTH_COOKIE` optional fallback for a PACER session cookie
+   - `PACER_AUTO_ACCEPT_FEES` optional. Set to `true` only if you want the app to submit PACER document/fee confirmation screens automatically.
    - `PACER_USERNAME_FIELD`, `PACER_PASSWORD_FIELD`, and `PACER_CLIENT_CODE_FIELD` optional overrides if PACER changes its login form
 
 4. In Google Cloud OAuth settings, add this redirect URI:
@@ -58,7 +59,7 @@ Deadline extraction is assistive only. Every legal deadline should be checked ag
 
 The dashboard is public unless `DASHBOARD_PASSWORD` is set, so set it before connecting a real mailbox.
 
-Do not put PACER credentials in the repo or send them in chat. Store them only as Render secret environment variables on both the web service and the cron service. PACER may charge fees, and some court links still require MFA, fee confirmation, a client-code screen, or manual download if the free-look link has already been used or expired.
+Do not put PACER credentials in the repo or send them in chat. Store them only as Render secret environment variables on both the web service and the cron service. PACER may charge fees. The app will log in and submit ordinary document-gate forms, but fee-confirmation pages require `PACER_AUTO_ACCEPT_FEES=true`. Some court links can still require MFA or manual download if the free-look link has already been used or expired.
 
 ## Schedule Note
 

@@ -11,6 +11,16 @@ const NOTICE_PATTERNS = [
   /docket/i
 ];
 
+const NON_COURT_PATTERNS = [
+  /security alert/i,
+  /new sign-in/i,
+  /google account/i,
+  /accounts\.google\.com/i,
+  /no-reply@accounts\.google\.com/i,
+  /password reset/i,
+  /verification code/i
+];
+
 const DEADLINE_PATTERNS = [
   /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|service|filed|file|appear|appearance|payment|plan|cure|bar date)\b.{0,220}?\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}/gi,
   /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|service|filed|file|appear|appearance|payment|plan|cure|bar date)\b.{0,220}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi,
@@ -24,6 +34,7 @@ const RELATIVE_DEADLINE_PATTERN = /\b(?:within|no later than|not later than|on o
 
 export function looksLikeCourtNotice(email) {
   const haystack = `${email.from}\n${email.subject}\n${email.snippet}\n${email.bodyText}`;
+  if (NON_COURT_PATTERNS.some((pattern) => pattern.test(haystack))) return false;
   return NOTICE_PATTERNS.some((pattern) => pattern.test(haystack));
 }
 

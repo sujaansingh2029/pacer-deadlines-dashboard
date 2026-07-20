@@ -36,6 +36,8 @@ services:
         sync: false
       - key: PACER_AUTH_COOKIE
         sync: false
+      - key: PACER_AUTO_ACCEPT_FEES
+        sync: false
       - key: CRON_SECRET
         generateValue: true
       - key: SESSION_SECRET
@@ -80,6 +82,8 @@ services:
       - key: PACER_CLIENT_CODE_FIELD
         sync: false
       - key: PACER_AUTH_COOKIE
+        sync: false
+      - key: PACER_AUTO_ACCEPT_FEES
         sync: false
       - key: CRON_SECRET
         generateValue: true

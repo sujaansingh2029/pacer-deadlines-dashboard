@@ -187,14 +187,16 @@ async function repairHtmlLinkedDocuments() {
         mime_type ilike 'text/html%'
         or read_status like 'read_error:%'
         or read_status like 'download_error:%'
+        or read_status = 'notice_read_pdf_blocked'
       )
-    limit 100
+    order by updated_at asc nulls first, created_at asc
+    limit 1000
   `);
 
   let repaired = 0;
   for (const row of result.rows) {
     const doc = await refreshDocumentFromSource(row.id);
-    if (doc?.content && !String(doc?.read_status || "").startsWith("download_error:")) repaired += 1;
+    if (doc?.content && !String(doc?.read_status || "").startsWith("download_error:") && doc?.read_status !== "notice_read_pdf_blocked") repaired += 1;
   }
   return repaired;
 }
@@ -275,6 +277,8 @@ export async function refreshDocumentFromSource(documentId) {
          read_status = $6,
          document_type = $7,
          document_summary = $8,
+         review_status = case when $6 = 'read' then 'open' else review_status end,
+         archived_at = case when $6 = 'read' then null else archived_at end,
          updated_at = now()
      where id = $9
      returning filename, mime_type, content, read_status, document_type, document_summary`,
@@ -664,7 +668,7 @@ async function fetchAuthenticatedDocument(url, fallbackFilename, jar, depth) {
       return await fetchAuthenticatedDocument(nestedUrl, filename, jar, depth + 1);
     }
     const formTarget = htmlFormAction(html, response.url || url);
-    if (formTarget && formTarget !== response.url && /(?:doc1|show_doc|view_doc|get_doc|pacer|login|cgi-bin)/i.test(formTarget)) {
+    if (shouldSubmitPacerForm(html, formTarget, response.url || url)) {
       const formValues = hiddenFormValues(html);
       const posted = await fetchWithJar(formTarget, {
         method: "POST",
@@ -708,8 +712,24 @@ async function responseToDownloaded(response, fallbackFilename, jar, depth) {
   const filename = sanitizeFilename(filenameFromDisposition(disposition) || fallbackFilename);
 
   if (depth < 3 && contentType.includes("html")) {
-    const nestedUrl = findNestedDocumentUrl(content.toString("utf8"), response.url);
+    const html = content.toString("utf8");
+    const nestedUrl = findNestedDocumentUrl(html, response.url);
     if (nestedUrl) return await fetchAuthenticatedDocument(nestedUrl, filename, jar, depth + 1);
+    const formTarget = htmlFormAction(html, response.url);
+    if (shouldSubmitPacerForm(html, formTarget, response.url)) {
+      const formValues = hiddenFormValues(html);
+      const posted = await fetchWithJar(formTarget, {
+        method: "POST",
+        redirect: "follow",
+        headers: {
+          "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Referer": response.url
+        },
+        body: formValues.toString()
+      }, jar);
+      return await responseToDownloaded(posted, filename, jar, depth + 1);
+    }
   }
 
   return {
@@ -788,7 +808,29 @@ function hiddenFormValues(html) {
       values.set(decodeHtmlAttribute(name), decodeHtmlAttribute(value));
     }
   }
+  const buttonPattern = /<button\b[^>]*>/gi;
+  for (const match of String(html || "").matchAll(buttonPattern)) {
+    const button = match[0];
+    const name = button.match(/\bname=["']?([^"'\s>]+)/i)?.[1];
+    if (!name) continue;
+    const value = button.match(/\bvalue=["']?([^"'>]*)/i)?.[1] || button.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    values.set(decodeHtmlAttribute(name), decodeHtmlAttribute(value));
+  }
   return values;
+}
+
+function shouldSubmitPacerForm(html, formTarget, currentUrl) {
+  const target = String(formTarget || "");
+  const current = String(currentUrl || "");
+  const text = bufferToText(Buffer.from(String(html || ""), "utf8"), "text/html").toLowerCase();
+  const looksLikeDocumentGate =
+    /(?:view|download|retrieve|display|continue|accept|submit).{0,80}(?:document|pdf|notice|docket|charge|fee|cost)/i.test(text) ||
+    /(?:document|pdf|notice|docket|charge|fee|cost).{0,80}(?:view|download|retrieve|display|continue|accept|submit)/i.test(text) ||
+    /(?:receipt|client code|transaction|one free look|free electronic copy|pacer fee|billing)/i.test(text);
+  const looksLikeCourtTarget = /(?:doc1|show_doc|view_doc|get_doc|pacer|login|cgi-bin|DktRpt|doc|pdf)/i.test(target || current);
+  const mentionsFees = /(?:fee|charge|cost|billing)/i.test(text);
+  if (mentionsFees && !config.pacerAutoAcceptFees) return false;
+  return looksLikeDocumentGate || (target !== current && looksLikeCourtTarget);
 }
 
 function fieldNameFor(html, configuredName, candidates, fallback) {

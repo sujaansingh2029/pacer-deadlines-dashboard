@@ -17,6 +17,7 @@ export const config = {
   pacerPasswordField: process.env.PACER_PASSWORD_FIELD,
   pacerClientCodeField: process.env.PACER_CLIENT_CODE_FIELD,
   pacerAuthCookie: process.env.PACER_AUTH_COOKIE,
+  pacerAutoAcceptFees: String(process.env.PACER_AUTO_ACCEPT_FEES || "").toLowerCase() === "true",
   cronSecret: process.env.CRON_SECRET || "dev-secret",
   sessionSecret: process.env.SESSION_SECRET || "dev-session-secret",
   dashboardPassword: process.env.DASHBOARD_PASSWORD
