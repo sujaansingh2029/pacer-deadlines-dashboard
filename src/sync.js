@@ -66,6 +66,14 @@ export async function syncMailbox(mailbox) {
   }
 }
 
+export async function retryBlockedDocuments() {
+  const repaired = await repairHtmlLinkedDocuments();
+  await backfillBlockedDocumentSummaries();
+  await backfillDocumentAnalysis();
+  const deadlineCount = await backfillDeadlinesFromReadDocuments();
+  return { repaired, deadlineCount };
+}
+
 async function processMessage(gmail, id, mailboxEmail, options = {}) {
   const exists = await pool.query("select 1 from emails where gmail_id = $1", [id]);
   if (exists.rowCount && !options.force) {
@@ -245,7 +253,7 @@ async function backfillBlockedDocumentSummaries() {
     const summary = summarizeLinkedDocumentNotice(context);
     if (!summary) continue;
     await pool.query(
-      "update documents set document_type = 'PACER PDF upload needed', document_summary = $1, extracted_text = coalesce(extracted_text, $1), read_status = 'notice_read_pdf_blocked', updated_at = now() where id = $2",
+      "update documents set document_type = 'PACER PDF pending', document_summary = $1, extracted_text = coalesce(extracted_text, $1), read_status = 'notice_read_pdf_blocked', updated_at = now() where id = $2",
       [summary, row.id]
     );
   }
@@ -384,9 +392,9 @@ async function analyzeSavedDocument(filename, mimeType, extracted, fallbackSumma
   const readStatus = String(extracted.status || "");
   if (!extracted.text || readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:") || readStatus.startsWith("read_error:") || readStatus === "stored_unreadable") {
     return {
-      documentType: readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:") ? "PACER PDF upload needed" : "Manual review required",
+      documentType: readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:") ? "PACER PDF pending" : "Manual review required",
       summary: readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:")
-        ? (fallbackSummary || "PACER did not release the PDF to the server. Open the document manually from the PACER email or docket, download the PDF, and upload it under this case so the dashboard can read it.")
+        ? (fallbackSummary || "PACER has not released the PDF to the server yet. The dashboard will retry this link automatically during hourly sync and when Retry PACER Fetch is clicked.")
         : "The document was saved, but the text could not be read clearly. Open it manually and verify any deadlines or hearing dates."
     };
   }
@@ -578,7 +586,7 @@ function summarizeLinkedDocumentNotice(context) {
   if (documentNumber) pieces.push(`Document number: ${documentNumber}.`);
   if (docDescription) pieces.push(`Description from court email: ${docDescription}.`);
   if (docketText) pieces.push(`Docket text from court email: ${docketText}.`);
-  pieces.push("The court email was read, but PACER did not release the actual PDF to the server. Upload the PDF under the case if full document review is needed.");
+  pieces.push("The court email was read, but PACER has not released the actual PDF to the server yet. The dashboard will retry this link automatically during hourly sync.");
   return pieces.join(" ").slice(0, 1200);
 }
 
@@ -773,7 +781,7 @@ async function fetchAuthenticatedDocument(url, fallbackFilename, jar, depth) {
       mimeType: contentType,
       size: content.length,
       content,
-      status: "download_error: PACER login did not release the document; manual PDF upload required"
+      status: "download_error: PACER login did not release the document yet"
     };
   }
 
@@ -821,7 +829,7 @@ async function responseToDownloaded(response, fallbackFilename, jar, depth) {
     size: content.length,
     content,
     status: contentType.includes("html")
-      ? "download_error: PACER login did not release the document; manual PDF upload required"
+      ? "download_error: PACER login did not release the document yet"
       : "downloaded"
   };
 }

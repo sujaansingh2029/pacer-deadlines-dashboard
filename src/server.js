@@ -7,7 +7,7 @@ import { assertRequiredConfig, config } from "./config.js";
 import { initDb, moveOldOpenItemsToHistory, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { analyzeDocument, extractNotice } from "./extract.js";
 import { authUrl, exchangeCode } from "./gmail.js";
-import { readDocumentText, refreshDocumentFromSource, syncMailbox } from "./sync.js";
+import { readDocumentText, refreshDocumentFromSource, retryBlockedDocuments, syncMailbox } from "./sync.js";
 
 const app = express();
 const upload = multer({
@@ -368,6 +368,11 @@ app.post("/documents/:id/archive", async (req, res) => {
   res.redirect(req.get("referer") || "/");
 });
 
+app.post("/documents/retry-blocked", async (req, res) => {
+  await retryBlockedDocuments();
+  res.redirect(req.get("referer") || "/");
+});
+
 app.post("/cases/:id/documents", upload.single("document"), async (req, res) => {
   const caseId = Number(req.params.id);
   const caseResult = await pool.query("select id, case_name, court, case_number, judge from cases where id = $1", [caseId]);
@@ -513,9 +518,10 @@ function documentUnavailableHtml(doc, action) {
     `<section class="panel narrow">
       <div class="panel-body">
         <h1>${title}</h1>
-        <p>The dashboard read the court email, but PACER did not release the actual PDF to the server.</p>
+        <p>The dashboard read the court email, but PACER has not released the actual PDF to the server yet.</p>
         ${doc.document_summary ? `<p>${escapeHtml(doc.document_summary)}</p>` : ""}
-        <p>Open the document from the PACER email or docket, download the PDF once, then upload it under the matching case. After upload, the dashboard will read and summarize it.</p>
+        <p>The app will retry this document automatically during hourly sync. You can also retry it now after confirming the PACER username, password, client code, and fee approval settings in Render.</p>
+        <form method="post" action="/documents/retry-blocked" class="inline-action-form"><button type="submit">Retry PACER Fetch</button></form>
         <a class="button secondary" href="/">Back to dashboard</a>
       </div>
     </section>`
@@ -617,6 +623,8 @@ function layout(title, body) {
     details.panel summary { list-style: none; cursor: pointer; }
     details.panel summary::-webkit-details-marker { display: none; }
     .section-note { padding: 10px 14px; border-bottom: 1px solid #edf0f5; color: var(--muted); font-size: 13px; }
+    .inline-action-form { padding: 10px 14px; border-bottom: 1px solid #edf0f5; margin: 0; }
+    .inline-action-form button { padding: 8px 11px; }
     table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid #edf0f5; vertical-align: top; font-size: 13px; }
     th { background: #f8fafc; color: #475467; font-weight: 800; }
@@ -659,6 +667,14 @@ function layout(title, body) {
     .upload-form button { padding: 7px 10px; font-size: 12px; }
     .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
     .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
+    .deadline-cards { display: grid; gap: 8px; padding: 10px; }
+    .deadline-card { display: grid; grid-template-columns: 34px minmax(150px, 210px) minmax(0, 1fr); gap: 12px; align-items: start; border: 1px solid #e4e7ec; border-radius: 8px; padding: 11px; background: #ffffff; }
+    .deadline-when { display: grid; gap: 7px; min-width: 0; }
+    .deadline-main { min-width: 0; display: grid; gap: 6px; }
+    .deadline-title { font-size: 14px; font-weight: 900; line-height: 1.3; overflow-wrap: anywhere; }
+    .deadline-case { font-weight: 800; line-height: 1.3; overflow-wrap: anywhere; }
+    .deadline-source { color: var(--muted); font-size: 13px; line-height: 1.38; overflow-wrap: anywhere; }
+    .deadline-meta { color: var(--muted); font-size: 12px; line-height: 1.35; }
     .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
     .chat-box { display: grid; gap: 10px; }
     .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
@@ -667,7 +683,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } }
   </style>
 </head>
 <body>
@@ -732,7 +748,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           ${simpleCount("Due today", stats.due_today)}
           ${simpleCount("Due tomorrow", stats.due_tomorrow)}
           ${simpleCount("Manual review", manualReview.length)}
-          ${simpleCount("PDF uploads", blockedDocuments.length)}
+          ${simpleCount("Pending PDFs", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
           ${simpleCount("Possible dates", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
@@ -840,8 +856,8 @@ function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments
     ? `${manualReview.length} active item(s). Check off anything already handled.`
     : "Nothing urgent is waiting for manual review.";
   const pdfText = blockedDocuments.length
-    ? `${blockedDocuments.length} active PDF request(s). Upload the PDF or check off if not needed.`
-    : "No PDF uploads needed right now.";
+    ? `${blockedDocuments.length} PDF(s) are waiting for PACER to release them. Click Sync Now or Retry PACER Fetch.`
+    : "All available PDFs are saved or there are no pending PDFs.";
   return `<section class="panel start-panel">
     <div class="panel-head">
       <div><h2>Start Here</h2><div class="muted">Use this order every time you open the dashboard.</div></div>
@@ -850,7 +866,7 @@ function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments
       ${stepCard("1", "Fix urgent review items", reviewText, manualReview.length ? "review" : "good")}
       ${stepCard("2", "Possible dates found", needsReview.length ? `${needsReview.length} lower-confidence date(s) are saved below, not treated as urgent.` : "No extra possible dates right now.", needsReview.length ? "normal" : "good")}
       ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
-      ${stepCard("4", "Upload full PDFs when needed", pdfText, blockedDocuments.length ? "review" : "good")}
+      ${stepCard("4", "Let PACER fetch PDFs", pdfText, blockedDocuments.length ? "normal" : "good")}
     </div>
   </section>`;
 }
@@ -887,18 +903,21 @@ function blockedDocumentSection(documents) {
   if (!documents.length) return "";
   return `<details class="panel">
     <summary class="panel-head">
-      <div><h2>PDF Uploads Needed</h2><div class="muted">${documents.length} court notice(s) were read, but the full PDF still needs to be uploaded.</div></div>
+      <div><h2>PDF Fetch Queue</h2><div class="muted">${documents.length} court document(s) are waiting for PACER to release a readable PDF.</div></div>
       <span class="muted">Open</span>
     </summary>
-    <div class="section-note">The agent read what was available in the court email. For the full filing, open the document from the original PACER email or docket, download the PDF once, then upload it under the matching case.</div>
+    <div class="section-note">The agent already read the email notice and will retry these links with the PACER login during each hourly sync. Use Retry PACER Fetch after changing PACER settings or fee approval.</div>
+    <form method="post" action="/documents/retry-blocked" class="inline-action-form">
+      <button type="submit">Retry PACER Fetch</button>
+    </form>
     ${table(
-      ["Done", "Received", "Case", "Document", "What the email says / next step"],
+      ["Done", "Received", "Case", "Document", "Status"],
       documents.map((doc) => [
         archiveButton(`/documents/${doc.id}/archive`, "Move document request to history"),
         `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
         escapeHtml(doc.case_name || "Case pending review"),
         `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
-        escapeHtml(doc.document_summary || "PACER did not release the PDF to the server. Upload the PDF under this case after opening it manually.")
+        escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")
       ])
     )}
   </details>`;
@@ -1123,18 +1142,24 @@ function historyStatusTag(status) {
 
 function deadlineTable(deadlines, compact) {
   if (!deadlines.length) return `<div class="empty">No open items here.</div>`;
-  return table(
-    ["Done", "Due", "Email Received", "Case", "Deadline", "Confidence", compact ? "Why review" : "Source"],
-    deadlines.map((d) => [
-      archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline"),
-      `<span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review")}</span>`,
-      formatDate(d.received_at) || "Review date pending",
-      caseLabel(d),
-      `<strong>${escapeHtml(d.label)}</strong>${d.source_quote ? `<br><span class="muted">${escapeHtml(d.source_quote)}</span>` : ""}`,
-      confidenceTag(d.confidence),
-      escapeHtml(compact ? (d.due_at ? "Low confidence" : "Missing parsed date") : (d.subject || ""))
-    ])
-  );
+  return `<div class="deadline-cards">${deadlines.map((d) => {
+    const reviewReason = compact ? (d.due_at ? "Low-confidence possible date" : "No exact due date parsed") : (d.subject || "");
+    return `<div class="deadline-card">
+      <div>${archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline")}</div>
+      <div class="deadline-when">
+        <div><span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review")}</span></div>
+        <div>${confidenceTag(d.confidence)}</div>
+        <div class="deadline-meta">Email received:<br>${formatDate(d.received_at) || "Review date pending"}</div>
+      </div>
+      <div class="deadline-main">
+        <div class="deadline-title">${escapeHtml(d.label)}</div>
+        <div class="deadline-case">${escapeHtml(d.case_name || "Case pending review")}</div>
+        <div class="deadline-meta">${escapeHtml([d.court, d.case_number].filter(Boolean).join(" | "))}</div>
+        ${d.source_quote ? `<div class="deadline-source">${escapeHtml(d.source_quote)}</div>` : ""}
+        ${reviewReason ? `<div class="deadline-meta">${escapeHtml(reviewReason)}</div>` : ""}
+      </div>
+    </div>`;
+  }).join("")}</div>`;
 }
 
 function activityList(events) {
@@ -1210,7 +1235,7 @@ function documentList(caseId, documents) {
       <button type="submit">Upload document</button>
     </form>`;
   if (!documents.length) {
-    return `<div class="document-list"><div class="case-section-title">Documents</div><div class="muted">No saved documents for this case yet. If PACER blocks the automatic link, upload the PDF here once and the dashboard will read it.</div>${uploadForm}</div>`;
+    return `<div class="document-list"><div class="case-section-title">Documents</div><div class="muted">No saved documents for this case yet. The dashboard will save PDFs automatically when PACER releases them.</div>${uploadForm}</div>`;
   }
   return `<div class="document-list"><div class="case-section-title">Documents</div>${uploadForm}${documents.map((doc) => `
     <div class="document-row">

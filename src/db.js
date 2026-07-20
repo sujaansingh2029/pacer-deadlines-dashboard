@@ -147,6 +147,22 @@ export async function getPrimaryMailbox() {
 
 export async function moveOldOpenItemsToHistory() {
   await pool.query(`
+    update documents
+    set document_type = 'PACER PDF pending',
+        document_summary = replace(
+          replace(coalesce(document_summary, ''), 'Upload the PDF under the case if full document review is needed.', 'The dashboard will retry this link automatically during hourly sync.'),
+          'Open the document manually from the PACER email or docket, download the PDF, and upload it under this case so the dashboard can read it.',
+          'The dashboard will retry this link automatically during hourly sync and when Retry PACER Fetch is clicked.'
+        ),
+        read_status = replace(coalesce(read_status, ''), '; manual PDF upload required', ' yet'),
+        updated_at = now()
+    where document_type = 'PACER PDF upload needed'
+       or read_status like '%manual PDF upload required%'
+       or document_summary like '%Upload the PDF%'
+       or document_summary like '%upload it under this case%'
+  `);
+
+  await pool.query(`
     update deadlines
     set status = 'history_auto',
         archived_at = coalesce(archived_at, now())
