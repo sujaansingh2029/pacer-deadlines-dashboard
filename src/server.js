@@ -4,8 +4,8 @@ import crypto from "crypto";
 import multer from "multer";
 import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
-import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
-import { analyzeDocument } from "./extract.js";
+import { initDb, moveOldOpenItemsToHistory, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
+import { analyzeDocument, extractNotice } from "./extract.js";
 import { authUrl, exchangeCode } from "./gmail.js";
 import { readDocumentText, refreshDocumentFromSource, syncMailbox } from "./sync.js";
 
@@ -50,21 +50,36 @@ app.get("/", async (_req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  const [deadlines, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, runs, stats] = await Promise.all([
+  await moveOldOpenItemsToHistory();
+
+  const [deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats] = await Promise.all([
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
-      join emails e on e.gmail_id = d.gmail_id
+      left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
       order by d.due_at nulls last, d.created_at desc
       limit 50
+    `),
+    deadlineWindowQuery(0, 1),
+    deadlineWindowQuery(1, 2),
+    pool.query(`
+      select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
+      from deadlines d
+      join cases c on c.id = d.case_id
+      left join emails e on e.gmail_id = d.gmail_id
+      where d.status = 'open'
+        and d.due_at is not null
+        and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
+      order by d.due_at asc
+      limit 25
     `),
     pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
-      join emails e on e.gmail_id = d.gmail_id
+      left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and (d.confidence = 'needs_review' or d.due_at is null)
       order by d.created_at desc
@@ -162,20 +177,29 @@ app.get("/", async (_req, res) => {
       order by coalesce(e.received_at, doc.created_at) desc
       limit 100
     `),
+    loadHistoryItems(),
     pool.query("select * from sync_runs order by started_at desc limit 5"),
     pool.query(`
       select
         (select count(*) from deadlines where status = 'open') as open_deadlines,
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
         (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
-        (select count(*) from documents) as documents
+        (select count(*) from documents) as documents,
+        (select count(*) from documents where read_status = 'read') as read_documents,
+        (select count(*) from documents where read_status <> 'read') as unread_documents,
+        ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open')) as history_items
     `)
   ]);
 
   res.send(layout("PACER Deadlines Dashboard", dashboardHtml({
     mailbox,
     deadlines: deadlines.rows,
+    dueToday: dueToday.rows,
+    dueTomorrow: dueTomorrow.rows,
+    overdue: overdue.rows,
     needsReview: needsReview.rows,
     events: events.rows,
     cases: cases.rows,
@@ -183,10 +207,70 @@ app.get("/", async (_req, res) => {
     notices: notices.rows,
     manualReview: manualReview.rows,
     blockedDocuments: blockedDocuments.rows,
+    historyItems: historyItems.rows,
     runs: runs.rows,
     stats: stats.rows[0]
   })));
 });
+
+function loadHistoryItems() {
+  return pool.query(`
+    select *
+    from (
+      select 'Deadline' as item_type,
+             d.id::text as item_id,
+             d.status,
+             d.archived_at,
+             d.created_at,
+             d.due_at as item_date,
+             coalesce(e.received_at, d.created_at) as received_at,
+             d.label as title,
+             coalesce(c.case_name, 'Case pending review') as case_name,
+             coalesce(c.case_number, '') as case_number,
+             coalesce(d.source_quote, e.subject, '') as detail
+      from deadlines d
+      join cases c on c.id = d.case_id
+      left join emails e on e.gmail_id = d.gmail_id
+      where d.status <> 'open'
+      union all
+      select 'Activity' as item_type,
+             de.id::text as item_id,
+             de.status,
+             de.archived_at,
+             de.created_at,
+             coalesce(de.filed_at, de.source_received_at, de.created_at) as item_date,
+             coalesce(e.received_at, de.source_received_at, de.created_at) as received_at,
+             coalesce(de.event_title, e.subject, 'Court activity') as title,
+             coalesce(c.case_name, 'Case pending review') as case_name,
+             coalesce(c.case_number, '') as case_number,
+             coalesce(de.summary, e.snippet, '') as detail
+      from docket_events de
+      join cases c on c.id = de.case_id
+      left join emails e on e.gmail_id = de.gmail_id
+      where de.status <> 'open'
+    ) history
+    order by coalesce(history.archived_at, history.item_date, history.created_at) desc
+    limit 150
+  `);
+}
+
+function deadlineWindowQuery(startDays, endDays) {
+  return pool.query(
+    `
+      select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
+      from deadlines d
+      join cases c on c.id = d.case_id
+      left join emails e on e.gmail_id = d.gmail_id
+      where d.status = 'open'
+        and d.due_at is not null
+        and d.due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + ($1::int * interval '1 day')) at time zone 'America/New_York')
+        and d.due_at < ((date_trunc('day', now() at time zone 'America/New_York') + ($2::int * interval '1 day')) at time zone 'America/New_York')
+      order by d.due_at asc, d.created_at desc
+      limit 25
+    `,
+    [startDays, endDays]
+  );
+}
 
 app.get("/auth/google", (_req, res) => {
   res.redirect(authUrl());
@@ -230,7 +314,7 @@ app.post("/events/:id/archive", async (req, res) => {
 
 app.post("/cases/:id/documents", upload.single("document"), async (req, res) => {
   const caseId = Number(req.params.id);
-  const caseResult = await pool.query("select id from cases where id = $1", [caseId]);
+  const caseResult = await pool.query("select id, case_name, court, case_number, judge from cases where id = $1", [caseId]);
   if (!caseResult.rowCount) return res.status(404).send("Case not found.");
   if (!req.file?.buffer?.length) return res.status(400).send("Choose a PDF or document to upload.");
 
@@ -263,8 +347,57 @@ app.post("/cases/:id/documents", upload.single("document"), async (req, res) => 
       analysis.summary
     ]
   );
+  if (extracted.text) {
+    await saveDeadlinesFromUploadedDocument(caseResult.rows[0], attachment.filename, extracted.text);
+  }
   res.redirect(req.get("referer") || "/");
 });
+
+async function saveDeadlinesFromUploadedDocument(caseRow, filename, text) {
+  const extraction = await extractNotice({
+    id: `manual-upload-${caseRow.id}-${Date.now()}`,
+    threadId: null,
+    from: "Manual document upload",
+    to: "",
+    subject: `Uploaded document: ${filename}`,
+    snippet: `Uploaded document for ${caseRow.case_name || caseRow.case_number || "case"}`,
+    receivedAt: new Date().toISOString(),
+    bodyText: [
+      `Case Name: ${caseRow.case_name || ""}`,
+      `Case Number: ${caseRow.case_number || ""}`,
+      `Court: ${caseRow.court || ""}`,
+      `Judge: ${caseRow.judge || ""}`,
+      `Uploaded document filename: ${filename}`,
+      "",
+      text
+    ].join("\n")
+  });
+
+  for (const deadline of extraction.deadlines || []) {
+    const exists = await pool.query(
+      `select 1 from deadlines
+       where case_id = $1
+         and status = 'open'
+         and coalesce(due_at::text, '') = coalesce($2::timestamptz::text, '')
+         and left(label, 240) = left($3, 240)
+       limit 1`,
+      [caseRow.id, deadline.dueAt || null, deadline.label || "Deadline needs review"]
+    );
+    if (exists.rowCount) continue;
+    await pool.query(
+      `insert into deadlines (case_id, gmail_id, label, due_at, date_text, confidence, source_quote)
+       values ($1,null,$2,$3,$4,$5,$6)`,
+      [
+        caseRow.id,
+        deadline.label || `Possible deadline from uploaded document: ${filename}`,
+        deadline.dueAt || null,
+        deadline.dateText || null,
+        deadline.confidence || "needs_review",
+        deadline.sourceQuote || `Uploaded document: ${filename}`
+      ]
+    );
+  }
+}
 
 app.get("/documents/:id/download", async (req, res) => {
   const doc = await loadDocumentForServing(req.params.id);
@@ -392,6 +525,17 @@ function layout(title, body) {
     .eyebrow { color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
     .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .due-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .due-card { background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-height: 120px; }
+    .due-card.overdue { border-color: #fda29b; }
+    .due-card.today { border-color: #f79009; }
+    .due-card.tomorrow { border-color: #84caff; }
+    .due-card-head { padding: 12px 14px; border-bottom: 1px solid #edf0f5; display: flex; justify-content: space-between; gap: 10px; align-items: center; }
+    .due-card-head strong { font-size: 16px; }
+    .due-card-count { font-size: 22px; font-weight: 900; }
+    .due-item { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 8px; padding: 10px 14px; border-bottom: 1px solid #edf0f5; }
+    .due-item:last-child { border-bottom: 0; }
+    .due-item-title { font-weight: 850; line-height: 1.25; }
     .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-height: 74px; }
     .metric strong { display: block; font-size: 26px; line-height: 1; margin-top: 8px; }
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
@@ -461,7 +605,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } }
   </style>
 </head>
 <body>
@@ -501,7 +645,7 @@ function loginHtml(hasError) {
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, runs, stats }) {
+function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
@@ -523,14 +667,19 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
       <section class="panel">
         <div class="panel-head"><h2>At A Glance</h2></div>
         <div class="panel-body simple-counts">
+          ${simpleCount("Due today", stats.due_today)}
+          ${simpleCount("Due tomorrow", stats.due_tomorrow)}
           ${simpleCount("Manual review", manualReview.length)}
           ${simpleCount("PDF uploads", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
           ${simpleCount("Need review", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
+          ${simpleCount("Docs read", stats.read_documents)}
+          ${simpleCount("History", stats.history_items)}
         </div>
       </section>
     </div>
+    ${dueNowPanel({ overdue, dueToday, dueTomorrow })}
     ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
     <div class="notice">The dashboard reads court emails every hour, saves anything it can read, and flags what needs a person. Always verify extracted deadlines against the docket and rules before relying on them.</div>
     <div class="layout">
@@ -572,6 +721,10 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
           <div class="section-note">Check an item when it has been reviewed and handled.</div>
           ${activityList(events)}
         </details>
+        <details class="panel" open>
+          <summary class="panel-head"><div><h2>History</h2><div class="muted">Checked-off items and anything automatically moved here after 5 days.</div></div><span class="muted">Open</span></summary>
+          ${historyTable(historyItems)}
+        </details>
         <details class="panel">
           <summary class="panel-head"><h2>Sync History</h2><span class="muted">Open</span></summary>
           ${table(
@@ -589,6 +742,33 @@ function dashboardHtml({ mailbox, deadlines, needsReview, events, cases, documen
       </div>
     </div>
   `;
+}
+
+function dueNowPanel({ overdue, dueToday, dueTomorrow }) {
+  return `<section class="due-strip">
+    ${dueBucket("Overdue", overdue, "overdue", "Past due or missed unless already handled")}
+    ${dueBucket("Due Today", dueToday, "today", "Handle before the end of today")}
+    ${dueBucket("Due Tomorrow", dueTomorrow, "tomorrow", "Prepare now so tomorrow is calm")}
+  </section>`;
+}
+
+function dueBucket(title, items, tone, emptyText) {
+  return `<div class="due-card ${tone}">
+    <div class="due-card-head">
+      <div><strong>${escapeHtml(title)}</strong><div class="muted">${escapeHtml(emptyText)}</div></div>
+      <div class="due-card-count">${items.length}</div>
+    </div>
+    ${items.length
+      ? items.slice(0, 4).map((item) => `<div class="due-item">
+          <div>${archiveButton(`/deadlines/${item.id}/archive`, "Archive deadline")}</div>
+          <div>
+            <div class="due-item-title">${escapeHtml(item.label)}</div>
+            <div class="muted">${formatDate(item.due_at)} · ${escapeHtml(item.case_name || "Case pending review")}</div>
+            ${item.source_quote ? `<div class="document-preview">${escapeHtml(item.source_quote.slice(0, 220))}</div>` : ""}
+          </div>
+        </div>`).join("")
+      : `<div class="empty">Nothing here.</div>`}
+  </div>`;
 }
 
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
@@ -652,16 +832,30 @@ function blockedDocumentSection(documents) {
 }
 
 async function loadAttorneyContext() {
-  const [deadlines, cases, events] = await Promise.all([
+  const [deadlines, dueToday, dueTomorrow, overdue, cases, events] = await Promise.all([
     pool.query(`
       select d.id, d.label, d.due_at, d.date_text, d.confidence, d.source_quote,
              c.case_name, c.court, c.case_number, c.judge, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
-      join emails e on e.gmail_id = d.gmail_id
+      left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
       order by d.due_at nulls last, d.created_at desc
       limit 75
+    `),
+    deadlineWindowQuery(0, 1),
+    deadlineWindowQuery(1, 2),
+    pool.query(`
+      select d.id, d.label, d.due_at, d.date_text, d.confidence, d.source_quote,
+             c.case_name, c.court, c.case_number, c.judge, e.subject, e.received_at
+      from deadlines d
+      join cases c on c.id = d.case_id
+      left join emails e on e.gmail_id = d.gmail_id
+      where d.status = 'open'
+        and d.due_at is not null
+        and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
+      order by d.due_at asc
+      limit 25
     `),
     pool.query(`
       select c.id, c.case_name, c.court, c.case_number, c.judge,
@@ -681,7 +875,7 @@ async function loadAttorneyContext() {
              de.source_received_at, de.summary, c.case_name, c.court, c.case_number, e.subject
       from docket_events de
       join cases c on c.id = de.case_id
-      join emails e on e.gmail_id = de.gmail_id
+      left join emails e on e.gmail_id = de.gmail_id
       where de.status = 'open'
       order by de.source_received_at desc nulls last, de.created_at desc
       limit 75
@@ -700,6 +894,9 @@ async function loadAttorneyContext() {
 
   return {
     openDeadlines: deadlines.rows,
+    overdue: overdue.rows,
+    dueToday: dueToday.rows,
+    dueTomorrow: dueTomorrow.rows,
     activeCases: cases.rows,
     recentCourtActivity: events.rows,
     documents: documents.rows
@@ -726,6 +923,8 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
     items.push("No extracted deadlines are currently flagged for attorney review.");
   }
 
+  items.push(`${Number(stats.due_today || 0)} item(s) due today and ${Number(stats.due_tomorrow || 0)} item(s) due tomorrow.`);
+
   if (nextDeadline) {
     items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Case pending review")} - ${escapeHtml(nextDeadline.label)}.`);
   } else {
@@ -741,7 +940,7 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
   }
 
   if (Number(stats.documents || 0) > 0) {
-    items.push(`${Number(stats.documents)} document(s) have been saved and grouped under their cases.`);
+    items.push(`${Number(stats.read_documents || 0)} of ${Number(stats.documents)} document(s) have been read and grouped under their cases.`);
   }
 
   return `<ul class="summary-list">${items.map((item) => `<li>${item}</li>`).join("")}</ul>`;
@@ -826,6 +1025,26 @@ function noticeTable(notices) {
       ];
     })
   );
+}
+
+function historyTable(items) {
+  if (!items.length) return `<div class="empty">No history yet. Checked-off items and old unchecked items will appear here.</div>`;
+  return table(
+    ["Moved", "Type", "Item", "Case", "Status"],
+    items.map((item) => [
+      `<span class="due">${formatDate(item.archived_at || item.item_date || item.created_at) || "History date pending"}</span><br><span class="muted">Received: ${formatDate(item.received_at) || "pending"}</span>`,
+      `<span class="tag">${escapeHtml(item.item_type)}</span>`,
+      `<strong>${escapeHtml(item.title || "History item")}</strong>${item.detail ? `<br><span class="muted">${escapeHtml(item.detail).slice(0, 500)}</span>` : ""}`,
+      `${escapeHtml(item.case_name || "Case pending review")}<br><span class="muted">${escapeHtml(item.case_number || "")}</span>`,
+      historyStatusTag(item.status)
+    ])
+  );
+}
+
+function historyStatusTag(status) {
+  if (status === "history_auto") return `<span class="tag review">moved after 5 days</span>`;
+  if (status === "archived") return `<span class="tag high">checked off</span>`;
+  return `<span class="tag">${escapeHtml(String(status || "history").replaceAll("_", " "))}</span>`;
 }
 
 function deadlineTable(deadlines, compact) {

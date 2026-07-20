@@ -140,3 +140,32 @@ export async function getPrimaryMailbox() {
   const result = await pool.query("select * from mailboxes order by created_at asc limit 1");
   return result.rows[0] || null;
 }
+
+export async function moveOldOpenItemsToHistory() {
+  const deadlineResult = await pool.query(`
+    update deadlines
+    set status = 'history_auto',
+        archived_at = now()
+    where status = 'open'
+      and (
+        (due_at is not null and due_at < now() - interval '5 days')
+        or (due_at is null and created_at < now() - interval '5 days')
+      )
+    returning id
+  `);
+
+  const eventResult = await pool.query(`
+    update docket_events
+    set status = 'history_auto',
+        archived_at = now()
+    where status = 'open'
+      and coalesce(source_received_at, created_at) < now() - interval '5 days'
+    returning id
+  `);
+
+  return {
+    deadlinesMoved: deadlineResult.rowCount,
+    eventsMoved: eventResult.rowCount,
+    totalMoved: deadlineResult.rowCount + eventResult.rowCount
+  };
+}

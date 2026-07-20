@@ -1,4 +1,4 @@
-import { pool } from "./db.js";
+import { moveOldOpenItemsToHistory, pool } from "./db.js";
 import { config } from "./config.js";
 import { analyzeDocument, extractNotice, looksLikeCourtNotice } from "./extract.js";
 import { gmailForRefreshToken, listCourtNoticeMessages, listIncomingMessages, readMessage } from "./gmail.js";
@@ -47,9 +47,11 @@ export async function syncMailbox(mailbox) {
     documentCount += await repairHtmlLinkedDocuments();
     await backfillBlockedDocumentSummaries();
     await backfillDocumentAnalysis();
+    const historyMove = await moveOldOpenItemsToHistory();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
-    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).`;
+    const historyNote = historyMove.totalMoved ? ` Moved ${historyMove.totalMoved} old item(s) to history.` : "";
+    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).${historyNote}`;
     await pool.query(
       "update sync_runs set finished_at = now(), scanned_count = $1, notice_count = $2, deadline_count = $3, document_count = $4, summary = $5 where id = $6",
       [scanned, notices, deadlineCount, documentCount, summary, runId]

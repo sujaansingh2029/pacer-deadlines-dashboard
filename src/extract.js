@@ -12,15 +12,15 @@ const NOTICE_PATTERNS = [
 ];
 
 const DEADLINE_PATTERNS = [
-  /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|filed|file)\b.{0,160}?\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}/gi,
-  /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|filed|file)\b.{0,160}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi,
-  /\b(?:no later than|on or before|by|due on|set for|scheduled for)\b.{0,120}?\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}/gi,
-  /\b(?:no later than|on or before|by|due on|set for|scheduled for)\b.{0,120}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi
+  /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|service|filed|file|appear|appearance|payment|plan|cure|bar date)\b.{0,220}?\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}/gi,
+  /\b(?:response|reply|objection|opposition|answer|brief|hearing|conference|deadline|due|continued|trial|status|motion|claim|confirmation|341|meeting|notice|serve|service|filed|file|appear|appearance|payment|plan|cure|bar date)\b.{0,220}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi,
+  /\b(?:no later than|not later than|on or before|by|due on|set for|scheduled for|must|shall|required to|ordered to|continued to)\b.{0,180}?\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}/gi,
+  /\b(?:no later than|not later than|on or before|by|due on|set for|scheduled for|must|shall|required to|ordered to|continued to)\b.{0,180}?\b\d{1,2}\/\d{1,2}\/\d{2,4}/gi
 ];
 
 const ABSOLUTE_DATE_PATTERN = /\b(?:(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?[,]?\s+)?(?:(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})(?:\s+(?:at\s+)?\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)?)?/gi;
 
-const RELATIVE_DEADLINE_PATTERN = /\b(?:within|no later than|not later than|on or before|before|after)\s+\d{1,3}\s+(?:calendar\s+)?(?:business\s+)?days?\b.{0,160}/gi;
+const RELATIVE_DEADLINE_PATTERN = /\b(?:within|no later than|not later than|on or before|before|after)\s+\d{1,3}\s+(?:calendar\s+)?(?:business\s+)?days?\b.{0,220}/gi;
 
 export function looksLikeCourtNotice(email) {
   const haystack = `${email.from}\n${email.subject}\n${email.snippet}\n${email.bodyText}`;
@@ -122,7 +122,7 @@ async function analyzeDocumentWithOpenAI(document, text) {
       {
         role: "system",
         content:
-          "Analyze a court filing or court notice document for a law office dashboard. Return strict JSON. Identify what kind of document it is and give a concise practical summary. Do not invent deadlines; if deadlines or hearing dates appear, mention that they must be verified."
+          "Analyze a court filing or court notice document for a law office dashboard. Return strict JSON. Identify what kind of document it is and give a concise practical summary for an attorney or paralegal. Focus on what changed, what needs action, and any due dates, hearing dates, objection dates, response dates, cure/payment dates, service requirements, or follow-up needed. Do not invent deadlines; if dates appear, mention that they must be verified against the docket and rules."
       },
       {
         role: "user",
@@ -259,6 +259,11 @@ function labelForDateContext(context, dateText) {
   if (lower.includes("trial")) return `Possible trial date: ${dateText}`;
   if (lower.includes("meeting") || lower.includes("341")) return `Possible meeting date: ${dateText}`;
   if (lower.includes("claim")) return `Possible claim deadline: ${dateText}`;
+  if (lower.includes("payment")) return `Possible payment date/deadline: ${dateText}`;
+  if (lower.includes("plan")) return `Possible plan deadline: ${dateText}`;
+  if (lower.includes("cure")) return `Possible cure deadline: ${dateText}`;
+  if (lower.includes("serve") || lower.includes("service")) return `Possible service deadline: ${dateText}`;
+  if (lower.includes("appear")) return `Possible appearance/hearing date: ${dateText}`;
   return `Possible court date/deadline: ${dateText}`;
 }
 
