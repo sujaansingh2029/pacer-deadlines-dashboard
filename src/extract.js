@@ -83,7 +83,7 @@ async function extractWithOpenAI(email) {
       {
         role: "system",
         content:
-          "Extract structured data from PACER/CM-ECF court notice emails and any attached/read document text. Return strict JSON. Be exhaustive about dates attorneys may need: response deadlines, objection deadlines, hearing dates, trial dates, status conferences, 341 meetings, claim deadlines, confirmation hearings, service/filing due dates, and dates hidden in docket text or document text. Do not invent dates. If a date may matter but the legal meaning is unclear, include it with confidence needs_review and quote the source."
+          "Extract structured data from PACER/CM-ECF court notice emails and any attached/read PDF document text. Return strict JSON. Be exhaustive about dates attorneys may need: response deadlines, objection deadlines, hearing dates, trial dates, status conferences, 341 meetings, claim deadlines, confirmation hearings, service/filing due dates, payment/change/cure dates, and dates hidden in docket text, orders, notices, motions, proofs of claim, certificates, or document text. Treat every date in a filed court PDF as potentially important unless clearly irrelevant. Do not invent dates. If a date may matter but the legal meaning is unclear, include it with confidence needs_review and quote the source."
       },
       {
         role: "user",

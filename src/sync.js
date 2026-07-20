@@ -47,11 +47,14 @@ export async function syncMailbox(mailbox) {
     documentCount += await repairHtmlLinkedDocuments();
     await backfillBlockedDocumentSummaries();
     await backfillDocumentAnalysis();
+    const documentDeadlineCount = await backfillDeadlinesFromReadDocuments();
+    deadlineCount += documentDeadlineCount;
     const historyMove = await moveOldOpenItemsToHistory();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
     const historyNote = historyMove.totalMoved ? ` Moved ${historyMove.totalMoved} old item(s) to history.` : "";
-    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).${historyNote}`;
+    const documentDeadlineNote = documentDeadlineCount ? ` Found ${documentDeadlineCount} additional deadline/date item(s) inside saved documents.` : "";
+    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).${documentDeadlineNote}${historyNote}`;
     await pool.query(
       "update sync_runs set finished_at = now(), scanned_count = $1, notice_count = $2, deadline_count = $3, document_count = $4, summary = $5 where id = $6",
       [scanned, notices, deadlineCount, documentCount, summary, runId]
@@ -246,6 +249,86 @@ async function backfillBlockedDocumentSummaries() {
       [summary, row.id]
     );
   }
+}
+
+async function backfillDeadlinesFromReadDocuments() {
+  const result = await pool.query(`
+    select doc.id, doc.case_id, doc.gmail_id, doc.filename, doc.extracted_text, doc.document_summary,
+           c.case_name, c.court, c.case_number, c.judge,
+           e.subject, e.received_at
+    from documents doc
+    join cases c on c.id = doc.case_id
+    left join emails e on e.gmail_id = doc.gmail_id
+    where doc.extracted_text is not null
+      and length(doc.extracted_text) >= 40
+      and (
+        doc.read_status = 'read'
+        or doc.read_status like 'read:%'
+      )
+    order by coalesce(doc.updated_at, doc.created_at) desc
+    limit 1000
+  `);
+
+  let inserted = 0;
+  for (const row of result.rows) {
+    const extraction = await extractNotice({
+      id: row.gmail_id || `document-${row.id}`,
+      threadId: null,
+      from: "Saved court document",
+      to: "",
+      subject: `${row.subject || "Saved document"} - ${row.filename}`,
+      snippet: row.document_summary || "",
+      receivedAt: row.received_at || new Date().toISOString(),
+      bodyText: [
+        `Case Name: ${row.case_name || ""}`,
+        `Case Number: ${row.case_number || ""}`,
+        `Court: ${row.court || ""}`,
+        `Judge: ${row.judge || ""}`,
+        `Document filename: ${row.filename || ""}`,
+        row.document_summary ? `Document summary: ${row.document_summary}` : "",
+        "",
+        "--- FULL SAVED DOCUMENT TEXT ---",
+        row.extracted_text
+      ].join("\n")
+    });
+    inserted += await insertMissingDocumentDeadlines(row, extraction.deadlines || []);
+  }
+  return inserted;
+}
+
+async function insertMissingDocumentDeadlines(documentRow, deadlines) {
+  let inserted = 0;
+  for (const deadline of deadlines) {
+    const label = deadline.label || `Possible deadline from ${documentRow.filename}`;
+    const sourceQuote = deadline.sourceQuote || `Saved document: ${documentRow.filename}`;
+    const exists = await pool.query(
+      `select 1
+       from deadlines
+       where case_id = $1
+         and status = 'open'
+         and coalesce(gmail_id, '') = coalesce($2, '')
+         and coalesce(due_at::text, '') = coalesce($3::timestamptz::text, '')
+         and left(label, 220) = left($4, 220)
+       limit 1`,
+      [documentRow.case_id, documentRow.gmail_id || null, deadline.dueAt || null, label]
+    );
+    if (exists.rowCount) continue;
+    await pool.query(
+      `insert into deadlines (case_id, gmail_id, label, due_at, date_text, confidence, source_quote)
+       values ($1,$2,$3,$4,$5,$6,$7)`,
+      [
+        documentRow.case_id,
+        documentRow.gmail_id || null,
+        label,
+        deadline.dueAt || null,
+        deadline.dateText || null,
+        deadline.confidence || "needs_review",
+        sourceQuote
+      ]
+    );
+    inserted += 1;
+  }
+  return inserted;
 }
 
 export async function refreshDocumentFromSource(documentId) {
@@ -904,7 +987,7 @@ export async function readDocumentText(attachment) {
     if (content.subarray(0, 5).toString("utf8") === "%PDF-") {
       const pdfParse = (await import("pdf-parse")).default;
       const parsed = await pdfParse(content);
-      return { status: "read", text: truncateText(parsed.text) };
+      return readablePdfText(parsed.text);
     }
 
     if (mimeType.startsWith("text/") || mimeType.includes("html") || /\.(txt|csv|html?|xml)$/i.test(filename)) {
@@ -914,13 +997,24 @@ export async function readDocumentText(attachment) {
     if (mimeType.includes("pdf") || filename.toLowerCase().endsWith(".pdf")) {
       const pdfParse = (await import("pdf-parse")).default;
       const parsed = await pdfParse(content);
-      return { status: "read", text: truncateText(parsed.text) };
+      return readablePdfText(parsed.text);
     }
 
     return { status: "stored_unreadable", text: null };
   } catch (error) {
     return { status: `read_error: ${error.message}`.slice(0, 200), text: null };
   }
+}
+
+function readablePdfText(text) {
+  const cleaned = truncateText(text);
+  if (cleaned.replace(/\s+/g, "").length < 40) {
+    return {
+      status: "read_error: PDF has little or no extractable text; OCR is needed",
+      text: cleaned || null
+    };
+  }
+  return { status: "read", text: cleaned };
 }
 
 function bufferToText(buffer, mimeType) {
