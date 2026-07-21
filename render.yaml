@@ -1,7 +1,0 @@
-services:
-  - type: web
-    name: dd-brief-generator
-    env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: HOST=0.0.0.0 python3 server.py
-    plan: free
