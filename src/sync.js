@@ -52,11 +52,22 @@ export async function syncMailbox(mailbox) {
     deadlineCount += documentDeadlineCount;
     await normalizeExistingDeadlineDates();
     const historyMove = await moveOldOpenItemsToHistory();
+    const documentStats = await pool.query(`
+      select
+        count(*) as total_documents,
+        count(*) filter (where read_status = 'read' or length(coalesce(extracted_text, '')) >= 40) as analyzed_documents,
+        count(*) filter (where read_status like 'download_error:%' or read_status = 'notice_read_pdf_blocked') as pending_documents
+      from documents
+    `);
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
     const historyNote = historyMove.totalMoved ? ` Moved ${historyMove.totalMoved} old item(s) to history.` : "";
     const documentDeadlineNote = documentDeadlineCount ? ` Found ${documentDeadlineCount} additional deadline/date item(s) inside saved documents.` : "";
-    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), saved/read ${documentCount} document(s).${documentDeadlineNote}${historyNote}`;
+    const docStats = documentStats.rows[0] || {};
+    const pendingNote = Number(docStats.pending_documents || 0)
+      ? ` ${Number(docStats.pending_documents)} PACER PDF(s) are still blocked by the court/PACER response.`
+      : "";
+    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), updated ${documentCount} document(s). ${Number(docStats.analyzed_documents || 0)} of ${Number(docStats.total_documents || 0)} document record(s) have readable text or notice detail.${documentDeadlineNote}${pendingNote}${historyNote}`;
     await pool.query(
       "update sync_runs set finished_at = now(), scanned_count = $1, notice_count = $2, deadline_count = $3, document_count = $4, summary = $5 where id = $6",
       [scanned, notices, deadlineCount, documentCount, summary, runId]
@@ -259,7 +270,12 @@ async function normalizeExistingDeadlineDates() {
     const parsed = parseDate(row.date_text || row.source_quote || "");
     if (!parsed) continue;
     await pool.query(
-      "update deadlines set due_at = $1 where id = $2 and (due_at is distinct from $1::timestamptz)",
+      `update deadlines
+       set due_at = $1,
+           confidence = case when confidence = 'needs_review' then 'medium' else confidence end,
+           label = regexp_replace(label, '^Possible ', '', 'i')
+       where id = $2
+         and (due_at is distinct from $1::timestamptz or confidence = 'needs_review' or label ~* '^Possible ')`,
       [parsed, row.id]
     );
   }
@@ -383,7 +399,7 @@ async function insertMissingDocumentDeadlines(documentRow, deadlines) {
         label,
         deadline.dueAt || null,
         deadline.dateText || null,
-        deadline.confidence || "needs_review",
+        deadline.confidence || (deadline.dueAt ? "medium" : "needs_review"),
         sourceQuote
       ]
     );
@@ -527,7 +543,7 @@ async function saveExtraction(email, extraction) {
         deadline.label || "Deadline needs review",
         deadline.dueAt || null,
         deadline.dateText || null,
-        deadline.confidence || "needs_review",
+        deadline.confidence || (deadline.dueAt ? "medium" : "needs_review"),
         deadline.sourceQuote || null
       ]
     );
@@ -720,7 +736,7 @@ async function fetchDocumentUrl(url, fallbackFilename, depth, options = {}) {
       mimeType: contentType,
       size: content.length,
       content,
-      status: "download_error: court returned an HTML page instead of the document"
+      status: pacerCredentialStatus("court returned an HTML page instead of the document")
     };
   }
 
@@ -768,7 +784,7 @@ async function loginToPacer(jar) {
     formValues.set(clientCodeField, config.pacerClientCode);
   }
 
-  await fetchWithJar(action, {
+  const loginResponse = await fetchWithJar(action, {
     method: "POST",
     redirect: "follow",
     headers: {
@@ -778,6 +794,11 @@ async function loginToPacer(jar) {
     },
     body: formValues.toString()
   }, jar);
+  const loginHtml = await loginResponse.text();
+  const text = bufferToText(Buffer.from(loginHtml, "utf8"), "text/html").toLowerCase();
+  if (/(?:invalid|incorrect|failed|try again).{0,80}(?:login|password|username)|(?:login|password|username).{0,80}(?:invalid|incorrect|failed)/i.test(text)) {
+    throw new Error("PACER login failed; check PACER_USERNAME and PACER_PASSWORD in Render");
+  }
 }
 
 async function fetchAuthenticatedDocument(url, fallbackFilename, jar, depth) {
@@ -814,6 +835,7 @@ async function fetchAuthenticatedDocument(url, fallbackFilename, jar, depth) {
     const formTarget = htmlFormAction(html, response.url || url);
     if (shouldSubmitPacerForm(html, formTarget, response.url || url)) {
       const formValues = hiddenFormValues(html);
+      addClientCodeIfNeeded(formValues, html);
       const posted = await fetchWithJar(formTarget, {
         method: "POST",
         redirect: "follow",
@@ -829,12 +851,13 @@ async function fetchAuthenticatedDocument(url, fallbackFilename, jar, depth) {
   }
 
   if (contentType.includes("html")) {
+    const reason = pacerHtmlBlockReason(content.toString("utf8"));
     return {
       filename,
       mimeType: contentType,
       size: content.length,
       content,
-      status: "download_error: PACER login did not release the document yet"
+      status: reason
     };
   }
 
@@ -862,6 +885,7 @@ async function responseToDownloaded(response, fallbackFilename, jar, depth) {
     const formTarget = htmlFormAction(html, response.url);
     if (shouldSubmitPacerForm(html, formTarget, response.url)) {
       const formValues = hiddenFormValues(html);
+      addClientCodeIfNeeded(formValues, html);
       const posted = await fetchWithJar(formTarget, {
         method: "POST",
         redirect: "follow",
@@ -882,7 +906,7 @@ async function responseToDownloaded(response, fallbackFilename, jar, depth) {
     size: content.length,
     content,
     status: contentType.includes("html")
-      ? "download_error: PACER login did not release the document yet"
+      ? pacerHtmlBlockReason(content.toString("utf8"))
       : "downloaded"
   };
 }
@@ -975,6 +999,32 @@ function shouldSubmitPacerForm(html, formTarget, currentUrl) {
   const mentionsFees = /(?:fee|charge|cost|billing)/i.test(text);
   if (mentionsFees && !config.pacerAutoAcceptFees) return false;
   return looksLikeDocumentGate || (target !== current && looksLikeCourtTarget);
+}
+
+function addClientCodeIfNeeded(formValues, html) {
+  if (!config.pacerClientCode) return;
+  const clientCodeField = fieldNameFor(html, config.pacerClientCodeField, ["clientcode", "client_code", "client"], null);
+  if (clientCodeField && !formValues.has(clientCodeField)) {
+    formValues.set(clientCodeField, config.pacerClientCode);
+  }
+}
+
+function pacerCredentialStatus(fallback) {
+  if (!config.pacerAuthCookie && (!config.pacerUsername || !config.pacerPassword)) {
+    return "download_error: PACER credentials are missing in this Render service";
+  }
+  return `download_error: ${fallback}`;
+}
+
+function pacerHtmlBlockReason(html) {
+  const text = bufferToText(Buffer.from(String(html || ""), "utf8"), "text/html").toLowerCase();
+  if (/(?:fee|charge|cost|billing|client code|receipt|transaction)/i.test(text) && !config.pacerAutoAcceptFees) {
+    return "download_error: PACER requires fee acceptance; set PACER_AUTO_ACCEPT_FEES=true in Render to let the app retrieve billable PDFs";
+  }
+  if (/(?:login|sign in|password|username)/i.test(text)) {
+    return "download_error: PACER login did not authenticate for this court document";
+  }
+  return "download_error: PACER login did not release the document yet";
 }
 
 function fieldNameFor(html, configuredName, candidates, fallback) {

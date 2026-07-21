@@ -192,7 +192,7 @@ function extractHeuristically(email) {
         label: match[0].slice(0, 120),
         dueAt: parseDate(match[0]),
         dateText: match[0],
-        confidence: "needs_review",
+        confidence: parseDate(match[0]) ? "medium" : "needs_review",
         sourceQuote: match[0]
       });
     }
@@ -236,7 +236,7 @@ function addSafetyNetDates(email, extraction) {
       label: labelForDateContext(context, match[0]),
       dueAt: parsedDate,
       dateText: match[0],
-      confidence: "needs_review",
+      confidence: parsedDate ? "medium" : "needs_review",
       sourceQuote: context
     });
   }
@@ -263,20 +263,20 @@ function addSafetyNetDates(email, extraction) {
 
 function labelForDateContext(context, dateText) {
   const lower = context.toLowerCase();
-  if (lower.includes("hearing")) return `Possible hearing date: ${dateText}`;
-  if (lower.includes("objection")) return `Possible objection deadline: ${dateText}`;
-  if (lower.includes("response")) return `Possible response deadline: ${dateText}`;
-  if (lower.includes("reply")) return `Possible reply deadline: ${dateText}`;
-  if (lower.includes("conference")) return `Possible conference date: ${dateText}`;
-  if (lower.includes("trial")) return `Possible trial date: ${dateText}`;
-  if (lower.includes("meeting") || lower.includes("341")) return `Possible meeting date: ${dateText}`;
-  if (lower.includes("claim")) return `Possible claim deadline: ${dateText}`;
-  if (lower.includes("payment")) return `Possible payment date/deadline: ${dateText}`;
-  if (lower.includes("plan")) return `Possible plan deadline: ${dateText}`;
-  if (lower.includes("cure")) return `Possible cure deadline: ${dateText}`;
-  if ((lower.includes("serve") || lower.includes("service")) && /\b(?:deadline|due|must|shall|required|ordered|no later|on or before|by)\b/i.test(lower)) return `Possible service deadline: ${dateText}`;
-  if (lower.includes("appear")) return `Possible appearance/hearing date: ${dateText}`;
-  return `Possible court date/deadline: ${dateText}`;
+  if (lower.includes("hearing")) return `Hearing date: ${dateText}`;
+  if (lower.includes("objection")) return `Objection deadline: ${dateText}`;
+  if (lower.includes("response")) return `Response deadline: ${dateText}`;
+  if (lower.includes("reply")) return `Reply deadline: ${dateText}`;
+  if (lower.includes("conference")) return `Conference date: ${dateText}`;
+  if (lower.includes("trial")) return `Trial date: ${dateText}`;
+  if (lower.includes("meeting") || lower.includes("341")) return `Meeting date: ${dateText}`;
+  if (lower.includes("claim")) return `Claim deadline: ${dateText}`;
+  if (lower.includes("payment")) return `Payment date/deadline: ${dateText}`;
+  if (lower.includes("plan")) return `Plan deadline: ${dateText}`;
+  if (lower.includes("cure")) return `Cure deadline: ${dateText}`;
+  if ((lower.includes("serve") || lower.includes("service")) && /\b(?:deadline|due|must|shall|required|ordered|no later|on or before|by)\b/i.test(lower)) return `Service deadline: ${dateText}`;
+  if (lower.includes("appear")) return `Appearance/hearing date: ${dateText}`;
+  return `Court date/deadline: ${dateText}`;
 }
 
 function isNonActionableDateContext(context) {
@@ -284,6 +284,7 @@ function isNonActionableDateContext(context) {
   if (/notice of electronic filing/.test(lower) && /\b(?:received|entered|filed)\b/.test(lower)) return true;
   if (/\b(?:entered|filed|received)\s+(?:on|from)\b/.test(lower) && !/\b(?:deadline|due|must|shall|required|ordered|hearing|objection|response|reply|trial|conference|meeting|appearance)\b/.test(lower)) return true;
   if (/\bnotice date\b/.test(lower) && !/\b(?:deadline|due|hearing|objection|response|reply|trial|conference|meeting)\b/.test(lower)) return true;
+  if (/electronic document stamp|filenumber|notice will be electronically mailed|bke?cfstamp/i.test(lower)) return true;
   if (/public access users|one free electronic copy|pacer access fees|30-page limit/.test(lower)) return true;
   if (/certificate of service/.test(lower) && !/\b(?:deadline|due|must|shall|required|ordered|no later|on or before)\b/.test(lower)) return true;
   return false;

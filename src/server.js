@@ -81,7 +81,7 @@ app.get("/", async (_req, res) => {
       join cases c on c.id = d.case_id
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
-        and (d.confidence = 'needs_review' or d.due_at is null)
+        and d.due_at is null
       order by d.created_at desc
       limit 25
     `),
@@ -198,10 +198,10 @@ app.get("/", async (_req, res) => {
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
-        (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
+        (select count(*) from deadlines where status = 'open' and due_at is null) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
         (select count(*) from documents) as documents,
-        (select count(*) from documents where read_status = 'read') as read_documents,
+        (select count(*) from documents where read_status = 'read' or length(coalesce(extracted_text, '')) >= 40) as read_documents,
         (select count(*) from documents where read_status <> 'read') as unread_documents,
         ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open') + (select count(*) from emails where coalesce(review_status, 'open') <> 'open') + (select count(*) from documents where coalesce(review_status, 'open') <> 'open')) as history_items
     `)
@@ -666,12 +666,12 @@ function layout(title, body) {
     .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
     .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
     .deadline-cards { display: grid; gap: 8px; padding: 10px; }
-    .deadline-card { display: grid; grid-template-columns: 34px minmax(150px, 210px) minmax(0, 1fr); gap: 12px; align-items: start; border: 1px solid #e4e7ec; border-radius: 8px; padding: 11px; background: #ffffff; }
-    .deadline-when { display: grid; gap: 7px; min-width: 0; }
+    .deadline-card { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; align-items: start; border: 1px solid #e4e7ec; border-radius: 8px; padding: 11px; background: #ffffff; }
+    .deadline-when { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; margin-bottom: 4px; }
     .deadline-main { min-width: 0; display: grid; gap: 6px; }
-    .deadline-title { font-size: 14px; font-weight: 900; line-height: 1.3; overflow-wrap: anywhere; }
+    .deadline-title { font-size: 15px; font-weight: 900; line-height: 1.3; overflow-wrap: anywhere; }
     .deadline-case { font-weight: 800; line-height: 1.3; overflow-wrap: anywhere; }
-    .deadline-source { color: var(--muted); font-size: 13px; line-height: 1.38; overflow-wrap: anywhere; }
+    .deadline-source { color: var(--muted); font-size: 13px; line-height: 1.38; overflow-wrap: anywhere; max-height: 4.2em; overflow: hidden; }
     .deadline-meta { color: var(--muted); font-size: 12px; line-height: 1.35; }
     .calendar-panel { margin-bottom: 10px; border-bottom: 1px solid #edf0f5; }
     .calendar-days { display: grid; gap: 10px; padding: 12px; }
@@ -775,11 +775,11 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           ${simpleCount("Due tomorrow", stats.due_tomorrow)}
           ${simpleCount("Meetings", meetingItems.length)}
           ${simpleCount("Manual review", manualReview.length)}
-          ${simpleCount("Pending PDFs", blockedDocuments.length)}
+          ${simpleCount("Blocked PDFs", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
-          ${simpleCount("Possible dates", stats.needs_review)}
+          ${simpleCount("Needs date", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
-          ${simpleCount("Docs read", stats.read_documents)}
+          ${simpleCount("Docs analyzed", stats.read_documents)}
           ${simpleCount("History", stats.history_items)}
         </div>
       </section>
@@ -793,7 +793,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
         ${manualReviewSection(manualReview)}
         <details class="panel">
           <summary class="panel-head">
-            <div><h2>Possible Dates</h2><div class="muted">Lower-confidence dates found in notices or documents. These do not count as due today/tomorrow unless the system sees action language.</div></div>
+            <div><h2>Needs Date</h2><div class="muted">Items where the system found court activity but could not parse an exact calendar date.</div></div>
             <span class="muted">Open</span>
           </summary>
           ${deadlineTable(needsReview, true)}
@@ -896,15 +896,15 @@ function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments
     ? `${manualReview.length} active item(s). Check off anything already handled.`
     : "Nothing urgent is waiting for manual review.";
   const pdfText = blockedDocuments.length
-    ? `${blockedDocuments.length} PDF(s) are waiting for PACER to release them. Click Sync Now or Retry PACER Fetch.`
-    : "All available PDFs are saved or there are no pending PDFs.";
+    ? `${blockedDocuments.length} PDF(s) are blocked by PACER/court response. Click Retry PACER Fetch after checking Render PACER settings.`
+    : "All available PDFs are saved or there are no blocked PDFs.";
   return `<section class="panel start-panel">
     <div class="panel-head">
       <div><h2>Start Here</h2><div class="muted">Use this order every time you open the dashboard.</div></div>
     </div>
     <div class="steps">
       ${stepCard("1", "Fix urgent review items", reviewText, manualReview.length ? "review" : "good")}
-      ${stepCard("2", "Possible dates found", needsReview.length ? `${needsReview.length} lower-confidence date(s) are saved below, not treated as urgent.` : "No extra possible dates right now.", needsReview.length ? "normal" : "good")}
+      ${stepCard("2", "Fix missing dates", needsReview.length ? `${needsReview.length} item(s) need an exact date.` : "No missing dates right now.", needsReview.length ? "normal" : "good")}
       ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
       ${stepCard("4", "Let PACER fetch PDFs", pdfText, blockedDocuments.length ? "normal" : "good")}
     </div>
@@ -943,10 +943,10 @@ function blockedDocumentSection(documents) {
   if (!documents.length) return "";
   return `<details class="panel">
     <summary class="panel-head">
-      <div><h2>PDF Fetch Queue</h2><div class="muted">${documents.length} court document(s) are waiting for PACER to release a readable PDF.</div></div>
+      <div><h2>PACER PDF Fetch Issues</h2><div class="muted">${documents.length} court document(s) did not return a readable PDF yet.</div></div>
       <span class="muted">Open</span>
     </summary>
-    <div class="section-note">The agent already read the email notice and will retry these links with the PACER login during each hourly sync. Use Retry PACER Fetch after changing PACER settings or fee approval.</div>
+    <div class="section-note">${pacerStatusText()} The agent retries these links during each hourly sync. If the reason mentions fees, set PACER_AUTO_ACCEPT_FEES=true in both Render services if you approve PACER charges.</div>
     <form method="post" action="/documents/retry-blocked" class="inline-action-form">
       <button type="submit">Retry PACER Fetch</button>
     </form>
@@ -957,10 +957,24 @@ function blockedDocumentSection(documents) {
         `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
         escapeHtml(doc.case_name || "Case pending review"),
         `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
-        escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")
+        `${escapeHtml(doc.read_status || "download pending")}<br><span class="muted">${escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")}</span>`
       ])
     )}
   </details>`;
+}
+
+function pacerStatusText() {
+  const loginConfigured = Boolean(config.pacerUsername && config.pacerPassword);
+  const cookieConfigured = Boolean(config.pacerAuthCookie);
+  const authText = loginConfigured
+    ? "PACER username/password are configured for this running service."
+    : cookieConfigured
+      ? "PACER auth cookie is configured for this running service."
+      : "PACER login is NOT configured for this running service.";
+  const feeText = config.pacerAutoAcceptFees
+    ? "PACER fee acceptance is enabled."
+    : "PACER fee acceptance is off.";
+  return `${authText} ${feeText}`;
 }
 
 async function loadAttorneyContext() {
@@ -1054,9 +1068,9 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
   const items = [];
 
   if (Number(stats.needs_review || 0) > 0) {
-    items.push(`${Number(stats.needs_review)} lower-confidence date(s) were saved as possible dates, but they are not treated as urgent deadlines.`);
+    items.push(`${Number(stats.needs_review)} item(s) still need an exact parsed date.`);
   } else {
-    items.push("No extra possible dates are waiting in the low-confidence bucket.");
+    items.push("No extracted court items are missing dates.");
   }
 
   items.push(`${Number(stats.due_today || 0)} item(s) due today and ${Number(stats.due_tomorrow || 0)} item(s) due tomorrow.`);
@@ -1082,7 +1096,7 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
   }
 
   if (Number(stats.documents || 0) > 0) {
-    items.push(`${Number(stats.read_documents || 0)} of ${Number(stats.documents)} document(s) have been read and grouped under their cases.`);
+    items.push(`${Number(stats.read_documents || 0)} of ${Number(stats.documents)} document(s) have readable text or notice detail grouped under their cases.`);
   }
 
   return `<ul class="summary-list">${items.map((item) => `<li>${item}</li>`).join("")}</ul>`;
@@ -1190,19 +1204,27 @@ function historyStatusTag(status) {
   return `<span class="tag">${escapeHtml(String(status || "history").replaceAll("_", " "))}</span>`;
 }
 
+function cleanDeadlineLabel(label) {
+  return String(label || "Deadline needs review")
+    .replace(/^Possible\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function deadlineTable(deadlines, compact) {
   if (!deadlines.length) return `<div class="empty">No open items here.</div>`;
   return `<div class="deadline-cards">${deadlines.map((d) => {
-    const reviewReason = compact ? (d.due_at ? "Low-confidence possible date" : "No exact due date parsed") : (d.subject || "");
+    const reviewReason = compact ? (d.due_at ? "Date parsed" : "No exact due date parsed") : (d.subject || "");
+    const label = cleanDeadlineLabel(d.label);
     return `<div class="deadline-card">
       <div>${archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline")}</div>
-      <div class="deadline-when">
-        <div><span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs review")}</span></div>
-        <div>${confidenceTag(d.confidence)}</div>
-        <div class="deadline-meta">Email received:<br>${formatDate(d.received_at) || "Review date pending"}</div>
-      </div>
       <div class="deadline-main">
-        <div class="deadline-title">${escapeHtml(d.label)}</div>
+        <div class="deadline-when">
+          <span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs date")}</span>
+          ${confidenceTag(d.confidence)}
+          <span class="deadline-meta">Email received: ${formatDate(d.received_at) || "Review date pending"}</span>
+        </div>
+        <div class="deadline-title">${escapeHtml(label)}</div>
         <div class="deadline-case">${escapeHtml(d.case_name || "Case pending review")}</div>
         <div class="deadline-meta">${escapeHtml([d.court, d.case_number].filter(Boolean).join(" | "))}</div>
         ${d.source_quote ? `<div class="deadline-source">${escapeHtml(d.source_quote)}</div>` : ""}

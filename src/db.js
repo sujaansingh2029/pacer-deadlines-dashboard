@@ -164,14 +164,26 @@ export async function moveOldOpenItemsToHistory() {
 
   await pool.query(`
     update deadlines
+    set label = regexp_replace(label, '^Possible ', '', 'i'),
+        confidence = case when due_at is not null and confidence = 'needs_review' then 'medium' else confidence end
+    where status = 'open'
+      and (label ~* '^Possible ' or (due_at is not null and confidence = 'needs_review'))
+  `);
+
+  await pool.query(`
+    update deadlines
     set status = 'history_auto',
         archived_at = coalesce(archived_at, now())
     where status = 'open'
-      and confidence = 'needs_review'
       and (
         lower(coalesce(label, '')) = 'notice date'
         or lower(coalesce(label, '')) like 'possible service deadline:%'
+        or lower(coalesce(label, '')) like 'court date/deadline:%'
+        or lower(coalesce(label, '')) like 'possible court date/deadline:%'
         or lower(coalesce(source_quote, '')) like '%notice of electronic filing%transaction was received%'
+        or lower(coalesce(source_quote, '')) like '%electronic document stamp%'
+        or lower(coalesce(source_quote, '')) like '%filenumber%'
+        or lower(coalesce(source_quote, '')) like '%notice will be electronically mailed%'
         or lower(coalesce(source_quote, '')) like '%public access users%'
         or lower(coalesce(source_quote, '')) like '%one free electronic copy%'
         or lower(coalesce(source_quote, '')) like '%pacer access fees%'
