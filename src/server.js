@@ -675,6 +675,19 @@ function layout(title, body) {
     .deadline-case { font-weight: 800; line-height: 1.3; overflow-wrap: anywhere; }
     .deadline-source { color: var(--muted); font-size: 13px; line-height: 1.38; overflow-wrap: anywhere; }
     .deadline-meta { color: var(--muted); font-size: 12px; line-height: 1.35; }
+    .calendar-panel { margin-bottom: 10px; border-bottom: 1px solid #edf0f5; }
+    .calendar-days { display: grid; gap: 10px; padding: 12px; }
+    .calendar-day { border: 1px solid #e4e7ec; border-radius: 8px; background: #ffffff; overflow: hidden; }
+    .calendar-day-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid #edf0f5; }
+    .calendar-date { font-weight: 900; }
+    .calendar-items { display: grid; gap: 0; }
+    .calendar-item { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; padding: 10px 12px; border-bottom: 1px solid #edf0f5; }
+    .calendar-item:last-child { border-bottom: 0; }
+    .calendar-time { font-weight: 900; color: #344054; white-space: nowrap; }
+    .calendar-title { font-weight: 900; line-height: 1.3; overflow-wrap: anywhere; }
+    .calendar-case { color: var(--muted); font-size: 13px; line-height: 1.35; }
+    .calendar-kind { display: inline-block; border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 900; background: #e7f0ff; color: #1849a9; margin-left: 6px; vertical-align: middle; }
+    .calendar-kind.meeting { background: #dcfae6; color: #05603a; }
     .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
     .chat-box { display: grid; gap: 10px; }
     .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
@@ -683,7 +696,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row, .calendar-item { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } }
   </style>
 </head>
 <body>
@@ -725,6 +738,8 @@ function loginHtml(hasError) {
 
 function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
+  const calendarItems = buildCalendarItems(deadlines);
+  const meetingItems = calendarItems.filter((item) => item.kind === "Meeting");
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
       <div>
@@ -747,6 +762,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
         <div class="panel-body simple-counts">
           ${simpleCount("Due today", stats.due_today)}
           ${simpleCount("Due tomorrow", stats.due_tomorrow)}
+          ${simpleCount("Meetings", meetingItems.length)}
           ${simpleCount("Manual review", manualReview.length)}
           ${simpleCount("Pending PDFs", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
@@ -758,6 +774,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
       </section>
     </div>
     ${dueNowPanel({ overdue, dueToday, dueTomorrow })}
+    ${meetingPanel(meetingItems)}
     ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
     <div class="notice">The dashboard reads court emails every hour, saves anything it can read, and flags what needs a person. Always verify extracted deadlines against the docket and rules before relying on them.</div>
     <div class="layout">
@@ -774,6 +791,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           <div class="panel-head">
             <div><h2>Deadline Calendar</h2><div class="muted">Date ordered, with the email received date shown for every item.</div></div>
           </div>
+          ${calendarPanel(calendarItems)}
           ${deadlineTable(deadlines, false)}
         </section>
         <section class="panel">
@@ -848,6 +866,17 @@ function dueBucket(title, items, tone, emptyText) {
         </div>`).join("")
       : `<div class="empty">Nothing here.</div>`}
   </div>`;
+}
+
+function meetingPanel(items) {
+  const upcoming = items.slice(0, 6);
+  return `<section class="panel calendar-panel">
+    <div class="panel-head">
+      <div><h2>Meetings & Hearings</h2><div class="muted">Court appearances, 341 meetings, conferences, hearings, trials, and status dates.</div></div>
+      <strong>${items.length}</strong>
+    </div>
+    ${upcoming.length ? calendarDays(upcoming) : `<div class="empty">No upcoming meetings or hearings found yet.</div>`}
+  </section>`;
 }
 
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
@@ -985,11 +1014,14 @@ async function loadAttorneyContext() {
     limit 100
   `);
 
+  const calendarItems = buildCalendarItems(deadlines.rows);
   return {
     openDeadlines: deadlines.rows,
     overdue: overdue.rows,
     dueToday: dueToday.rows,
     dueTomorrow: dueTomorrow.rows,
+    calendarItems,
+    meetingsAndHearings: calendarItems.filter((item) => item.kind === "Meeting"),
     activeCases: cases.rows,
     recentCourtActivity: events.rows,
     documents: documents.rows
@@ -1006,6 +1038,7 @@ function simpleCount(label, value) {
 
 function summaryList({ deadlines, needsReview, events, cases, stats }) {
   const nextDeadline = deadlines.find((d) => d.due_at && d.confidence !== "needs_review");
+  const nextMeeting = buildCalendarItems(deadlines).find((item) => item.kind === "Meeting");
   const nextCase = cases.find((c) => c.next_deadline_at) || cases[0];
   const latestEvent = events[0];
   const items = [];
@@ -1022,6 +1055,12 @@ function summaryList({ deadlines, needsReview, events, cases, stats }) {
     items.push(`Next deadline: ${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "date needs review")} for ${escapeHtml(nextDeadline.case_name || "Case pending review")} - ${escapeHtml(nextDeadline.label)}.`);
   } else {
     items.push("No high-confidence open deadlines have been extracted yet.");
+  }
+
+  if (nextMeeting) {
+    items.push(`Next meeting/hearing: ${formatDate(nextMeeting.startsAt)} for ${escapeHtml(nextMeeting.caseName || "Case pending review")} - ${escapeHtml(nextMeeting.title)}.`);
+  } else {
+    items.push("No upcoming meetings or hearings have been extracted yet.");
   }
 
   if (nextCase) {
@@ -1044,6 +1083,7 @@ function chatPanel() {
     <div class="chat-box">
       <div class="quick-prompts">
         <button class="prompt-chip" type="button" data-prompt="What are the next 7 days of deadlines?">Next 7 days</button>
+        <button class="prompt-chip" type="button" data-prompt="What meetings or hearings are coming up?">Meetings</button>
         <button class="prompt-chip" type="button" data-prompt="Which cases need attorney review right now?">Needs review</button>
         <button class="prompt-chip" type="button" data-prompt="Summarize upcoming case activity by case.">By case</button>
       </div>
@@ -1160,6 +1200,70 @@ function deadlineTable(deadlines, compact) {
       </div>
     </div>`;
   }).join("")}</div>`;
+}
+
+function calendarPanel(items) {
+  const upcoming = items.slice(0, 24);
+  return `<div class="calendar-panel">
+    <div class="section-note">Upcoming calendar, grouped by day. Meetings and hearings are highlighted in green.</div>
+    ${upcoming.length ? calendarDays(upcoming) : `<div class="empty">No dated calendar items found yet.</div>`}
+  </div>`;
+}
+
+function calendarDays(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const key = calendarDateLabel(item.startsAt);
+    const list = groups.get(key) || [];
+    list.push(item);
+    groups.set(key, list);
+  }
+
+  return `<div class="calendar-days">${[...groups.entries()].map(([dateLabel, dayItems]) => `
+    <div class="calendar-day">
+      <div class="calendar-day-head">
+        <div class="calendar-date">${escapeHtml(dateLabel)}</div>
+        <div class="muted">${dayItems.length} item${dayItems.length === 1 ? "" : "s"}</div>
+      </div>
+      <div class="calendar-items">${dayItems.map((item) => `
+        <div class="calendar-item">
+          <div class="calendar-time">${escapeHtml(calendarTimeLabel(item))}</div>
+          <div>
+            <div class="calendar-title">${escapeHtml(item.title)} <span class="calendar-kind ${item.kind === "Meeting" ? "meeting" : ""}">${escapeHtml(item.kind)}</span></div>
+            <div class="calendar-case">${escapeHtml(item.caseName || "Case pending review")}${item.caseNumber ? ` | ${escapeHtml(item.caseNumber)}` : ""}</div>
+            ${item.source ? `<div class="calendar-case">${escapeHtml(item.source)}</div>` : ""}
+          </div>
+        </div>
+      `).join("")}</div>
+    </div>
+  `).join("")}</div>`;
+}
+
+function buildCalendarItems(deadlines) {
+  const now = new Date();
+  const end = new Date(now.getTime() + 120 * 24 * 60 * 60 * 1000);
+  return (deadlines || [])
+    .filter((deadline) => deadline.due_at && (deadline.confidence !== "needs_review" || isMeetingLike(deadline)))
+    .map((deadline) => ({
+      id: deadline.id,
+      startsAt: deadline.due_at,
+      dateText: deadline.date_text,
+      title: deadline.label || "Court date",
+      kind: isMeetingLike(deadline) ? "Meeting" : "Deadline",
+      caseName: deadline.case_name,
+      caseNumber: deadline.case_number,
+      source: deadline.subject || deadline.source_quote || ""
+    }))
+    .filter((item) => {
+      const starts = new Date(item.startsAt);
+      return starts >= new Date(now.getTime() - 24 * 60 * 60 * 1000) && starts <= end;
+    })
+    .sort((a, b) => new Date(a.startsAt) - new Date(b.startsAt));
+}
+
+function isMeetingLike(item) {
+  const text = `${item.label || ""}\n${item.source_quote || ""}\n${item.subject || ""}`.toLowerCase();
+  return /\b(?:hearing|conference|meeting|341|appearance|appear|trial|status conference|calendar call|courtroom|zoom|telephone conference|video conference)\b/.test(text);
 }
 
 function activityList(events) {
@@ -1303,6 +1407,30 @@ function table(headers, rows) {
 
 function caseLabel(row) {
   return `${escapeHtml(row.case_name || "Case pending review")}<br><span class="muted">${escapeHtml([row.court, row.case_number].filter(Boolean).join(" | "))}</span>`;
+}
+
+function calendarDateLabel(value) {
+  if (!value) return "Date pending";
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric"
+  }).format(new Date(value));
+}
+
+function calendarTimeLabel(item) {
+  const value = item?.startsAt || item;
+  if (!value) return "Time pending";
+  if (item?.dateText && !/\d{1,2}:\d{2}\s*(?:a\.?m\.?|p\.?m\.?|am|pm)?/i.test(String(item.dateText))) {
+    return "Date only";
+  }
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value));
 }
 
 function formatDate(value) {
