@@ -71,7 +71,6 @@ app.get("/", async (_req, res) => {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
-        and d.confidence <> 'needs_review'
         and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
       order by d.due_at asc
       limit 25
@@ -98,7 +97,7 @@ app.get("/", async (_req, res) => {
     pool.query(`
       select
         c.*,
-        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null and d.confidence <> 'needs_review') as next_deadline_at,
+        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
         count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
         count(distinct de.id) filter (where de.status = 'open') as open_event_count,
         max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at,
@@ -196,9 +195,9 @@ app.get("/", async (_req, res) => {
     pool.query(`
       select
         (select count(*) from deadlines where status = 'open') as open_deadlines,
-        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
-        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
-        (select count(*) from deadlines where status = 'open' and confidence <> 'needs_review' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York')) as due_today,
+        (select count(*) from deadlines where status = 'open' and due_at is not null and due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + interval '1 day') at time zone 'America/New_York') and due_at < ((date_trunc('day', now() at time zone 'America/New_York') + interval '2 days') at time zone 'America/New_York')) as due_tomorrow,
         (select count(*) from deadlines where status = 'open' and (confidence = 'needs_review' or due_at is null)) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
         (select count(*) from documents) as documents,
@@ -308,7 +307,6 @@ function deadlineWindowQuery(startDays, endDays) {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
-        and d.confidence <> 'needs_review'
         and d.due_at >= ((date_trunc('day', now() at time zone 'America/New_York') + ($1::int * interval '1 day')) at time zone 'America/New_York')
         and d.due_at < ((date_trunc('day', now() at time zone 'America/New_York') + ($2::int * interval '1 day')) at time zone 'America/New_York')
       order by d.due_at asc, d.created_at desc
@@ -688,6 +686,19 @@ function layout(title, body) {
     .calendar-case { color: var(--muted); font-size: 13px; line-height: 1.35; }
     .calendar-kind { display: inline-block; border-radius: 999px; padding: 2px 7px; font-size: 11px; font-weight: 900; background: #e7f0ff; color: #1849a9; margin-left: 6px; vertical-align: middle; }
     .calendar-kind.meeting { background: #dcfae6; color: #05603a; }
+    .interactive-calendar { padding: 12px; border-bottom: 1px solid #edf0f5; display: grid; gap: 10px; }
+    .calendar-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
+    .calendar-weekday { color: var(--muted); font-size: 11px; font-weight: 900; text-align: center; text-transform: uppercase; }
+    .calendar-button { min-height: 78px; background: #fff; color: var(--ink); border: 1px solid #e4e7ec; border-radius: 8px; padding: 8px; text-align: left; display: grid; align-content: start; gap: 4px; font-weight: 800; }
+    .calendar-button:hover, .calendar-button.active { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(23, 92, 211, .12); }
+    .calendar-button.today { background: #eff6ff; border-color: #84caff; }
+    .calendar-button.has-items { background: #f6fef9; border-color: #abefc6; }
+    .calendar-day-number { font-size: 13px; }
+    .calendar-dot-row { display: flex; gap: 3px; flex-wrap: wrap; }
+    .calendar-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--blue); }
+    .calendar-dot.meeting { background: var(--green); }
+    .calendar-selected { border: 1px solid #e4e7ec; border-radius: 8px; background: #fff; overflow: hidden; }
+    .calendar-selected-head { padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid #edf0f5; font-weight: 900; }
     .case-section-title { font-size: 12px; font-weight: 900; color: #475467; text-transform: uppercase; letter-spacing: .04em; margin: 2px 0; }
     .chat-box { display: grid; gap: 10px; }
     .chat-answer { min-height: 92px; border: 1px solid #e4e7ec; background: #f8fafc; border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; line-height: 1.45; }
@@ -696,7 +707,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row, .calendar-item { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row, .calendar-item { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } .calendar-grid { gap: 4px; } .calendar-button { min-height: 54px; padding: 6px; } }
   </style>
 </head>
 <body>
@@ -880,7 +891,7 @@ function meetingPanel(items) {
 }
 
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
-  const nextDeadline = deadlines.find((deadline) => deadline.due_at && deadline.confidence !== "needs_review");
+  const nextDeadline = deadlines.find((deadline) => deadline.due_at);
   const reviewText = manualReview.length
     ? `${manualReview.length} active item(s). Check off anything already handled.`
     : "Nothing urgent is waiting for manual review.";
@@ -974,14 +985,13 @@ async function loadAttorneyContext() {
       left join emails e on e.gmail_id = d.gmail_id
       where d.status = 'open'
         and d.due_at is not null
-        and d.confidence <> 'needs_review'
         and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
       order by d.due_at asc
       limit 25
     `),
     pool.query(`
       select c.id, c.case_name, c.court, c.case_number, c.judge,
-             min(d.due_at) filter (where d.status = 'open' and d.due_at is not null and d.confidence <> 'needs_review') as next_deadline_at,
+             min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
              count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
              count(distinct de.id) filter (where de.status = 'open') as open_event_count,
              max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at
@@ -1037,7 +1047,7 @@ function simpleCount(label, value) {
 }
 
 function summaryList({ deadlines, needsReview, events, cases, stats }) {
-  const nextDeadline = deadlines.find((d) => d.due_at && d.confidence !== "needs_review");
+  const nextDeadline = deadlines.find((d) => d.due_at);
   const nextMeeting = buildCalendarItems(deadlines).find((item) => item.kind === "Meeting");
   const nextCase = cases.find((c) => c.next_deadline_at) || cases[0];
   const latestEvent = events[0];
@@ -1206,8 +1216,79 @@ function calendarPanel(items) {
   const upcoming = items.slice(0, 24);
   return `<div class="calendar-panel">
     <div class="section-note">Upcoming calendar, grouped by day. Meetings and hearings are highlighted in green.</div>
+    ${interactiveCalendar(items)}
     ${upcoming.length ? calendarDays(upcoming) : `<div class="empty">No dated calendar items found yet.</div>`}
   </div>`;
+}
+
+function interactiveCalendar(items) {
+  const today = startOfEasternDay(new Date());
+  const days = Array.from({ length: 35 }, (_, index) => new Date(today.getTime() + index * 24 * 60 * 60 * 1000));
+  const itemsByDay = new Map();
+  for (const item of items) {
+    const key = calendarDateKey(item.startsAt);
+    const list = itemsByDay.get(key) || [];
+    list.push(item);
+    itemsByDay.set(key, list);
+  }
+  const initialKey = itemsByDay.has(calendarDateKey(today)) ? calendarDateKey(today) : (items[0] ? calendarDateKey(items[0].startsAt) : calendarDateKey(today));
+  const safeItems = items.map((item) => ({
+    key: calendarDateKey(item.startsAt),
+    time: calendarTimeLabel(item),
+    title: item.title,
+    kind: item.kind,
+    caseName: item.caseName || "Case pending review",
+    caseNumber: item.caseNumber || "",
+    source: item.source || ""
+  }));
+
+  return `<div class="interactive-calendar">
+    <div class="calendar-grid">
+      ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => `<div class="calendar-weekday">${day}</div>`).join("")}
+      ${days.map((day) => {
+        const key = calendarDateKey(day);
+        const dayItems = itemsByDay.get(key) || [];
+        return `<button class="calendar-button ${key === calendarDateKey(today) ? "today" : ""} ${dayItems.length ? "has-items" : ""} ${key === initialKey ? "active" : ""}" type="button" data-calendar-day="${key}">
+          <span class="calendar-day-number">${Number(key.slice(-2))}</span>
+          <span class="calendar-dot-row">${dayItems.slice(0, 4).map((item) => `<span class="calendar-dot ${item.kind === "Meeting" ? "meeting" : ""}"></span>`).join("")}</span>
+          ${dayItems.length ? `<span class="deadline-meta">${dayItems.length} item${dayItems.length === 1 ? "" : "s"}</span>` : ""}
+        </button>`;
+      }).join("")}
+    </div>
+    <div class="calendar-selected">
+      <div class="calendar-selected-head" id="calendar-selected-title">${escapeHtml(calendarDateLabel(initialKey))}</div>
+      <div id="calendar-selected-items">${calendarSelectedItems((itemsByDay.get(initialKey) || []))}</div>
+    </div>
+    <script>
+      window.calendarItems = ${JSON.stringify(safeItems).replace(/</g, "\\u003c")};
+      function renderCalendarDay(key) {
+        document.querySelectorAll("[data-calendar-day]").forEach((button) => button.classList.toggle("active", button.dataset.calendarDay === key));
+        const title = document.getElementById("calendar-selected-title");
+        const target = document.getElementById("calendar-selected-items");
+        const items = (window.calendarItems || []).filter((item) => item.key === key);
+        title.textContent = new Date(key + "T12:00:00-04:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+        target.innerHTML = items.length ? items.map((item) => '<div class="calendar-item"><div class="calendar-time">' + escapeClient(item.time) + '</div><div><div class="calendar-title">' + escapeClient(item.title) + ' <span class="calendar-kind ' + (item.kind === "Meeting" ? "meeting" : "") + '">' + escapeClient(item.kind) + '</span></div><div class="calendar-case">' + escapeClient(item.caseName) + (item.caseNumber ? ' | ' + escapeClient(item.caseNumber) : '') + '</div>' + (item.source ? '<div class="calendar-case">' + escapeClient(item.source) + '</div>' : '') + '</div></div>').join("") : '<div class="empty">Nothing scheduled for this day.</div>';
+      }
+      function escapeClient(value) {
+        return String(value || "").replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[char]));
+      }
+      document.querySelectorAll("[data-calendar-day]").forEach((button) => button.addEventListener("click", () => renderCalendarDay(button.dataset.calendarDay)));
+    </script>
+  </div>`;
+}
+
+function calendarSelectedItems(items) {
+  if (!items.length) return `<div class="empty">Nothing scheduled for this day.</div>`;
+  return items.map((item) => `
+    <div class="calendar-item">
+      <div class="calendar-time">${escapeHtml(calendarTimeLabel(item))}</div>
+      <div>
+        <div class="calendar-title">${escapeHtml(item.title)} <span class="calendar-kind ${item.kind === "Meeting" ? "meeting" : ""}">${escapeHtml(item.kind)}</span></div>
+        <div class="calendar-case">${escapeHtml(item.caseName || "Case pending review")}${item.caseNumber ? ` | ${escapeHtml(item.caseNumber)}` : ""}</div>
+        ${item.source ? `<div class="calendar-case">${escapeHtml(item.source)}</div>` : ""}
+      </div>
+    </div>
+  `).join("");
 }
 
 function calendarDays(items) {
@@ -1243,7 +1324,7 @@ function buildCalendarItems(deadlines) {
   const now = new Date();
   const end = new Date(now.getTime() + 120 * 24 * 60 * 60 * 1000);
   return (deadlines || [])
-    .filter((deadline) => deadline.due_at && (deadline.confidence !== "needs_review" || isMeetingLike(deadline)))
+    .filter((deadline) => deadline.due_at)
     .map((deadline) => ({
       id: deadline.id,
       startsAt: deadline.due_at,
@@ -1411,13 +1492,31 @@ function caseLabel(row) {
 
 function calendarDateLabel(value) {
   if (!value) return "Date pending";
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(value))
+    ? new Date(`${value}T12:00:00-04:00`)
+    : new Date(value);
   return new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     weekday: "short",
     month: "short",
     day: "numeric",
     year: "numeric"
-  }).format(new Date(value));
+  }).format(date);
+}
+
+function calendarDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function startOfEasternDay(value) {
+  const key = calendarDateKey(value);
+  return new Date(`${key}T12:00:00-04:00`);
 }
 
 function calendarTimeLabel(item) {

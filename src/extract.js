@@ -333,10 +333,66 @@ function firstMatch(text, pattern) {
   return match?.[1]?.trim() || null;
 }
 
-function parseDate(text) {
+export function parseDate(text) {
   const dateText = firstMatch(text, /((?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s+\d{4})/i)
     || firstMatch(text, /(\d{1,2}\/\d{1,2}\/\d{2,4})/);
   if (!dateText) return null;
+  const dateParts = parseUsDateParts(dateText);
+  if (dateParts) {
+    const time = parseTimeParts(text);
+    const offset = easternOffsetForMonth(dateParts.month);
+    const hour = time?.hour ?? 12;
+    const minute = time?.minute ?? 0;
+    const iso = [
+      String(dateParts.year).padStart(4, "0"),
+      String(dateParts.month).padStart(2, "0"),
+      String(dateParts.day).padStart(2, "0")
+    ].join("-") + `T${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:00${offset}`;
+    const parsed = new Date(iso);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
   const parsed = new Date(dateText);
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
+function parseUsDateParts(dateText) {
+  const slash = String(dateText || "").match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
+  if (slash) {
+    const year = Number(slash[3].length === 2 ? `20${slash[3]}` : slash[3]);
+    return { month: Number(slash[1]), day: Number(slash[2]), year };
+  }
+  const monthNames = {
+    jan: 1, january: 1,
+    feb: 2, february: 2,
+    mar: 3, march: 3,
+    apr: 4, april: 4,
+    may: 5,
+    jun: 6, june: 6,
+    jul: 7, july: 7,
+    aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9,
+    oct: 10, october: 10,
+    nov: 11, november: 11,
+    dec: 12, december: 12
+  };
+  const named = String(dateText || "").match(/\b([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\b/);
+  if (!named) return null;
+  const month = monthNames[named[1].toLowerCase()];
+  if (!month) return null;
+  return { month, day: Number(named[2]), year: Number(named[3]) };
+}
+
+function parseTimeParts(text) {
+  const match = String(text || "").match(/\b(?:at\s+)?(\d{1,2}):(\d{2})\s*(a\.?m\.?|p\.?m\.?|am|pm)?\b/i);
+  if (!match) return null;
+  let hour = Number(match[1]);
+  const minute = Number(match[2]);
+  const meridiem = String(match[3] || "").toLowerCase();
+  if (meridiem.startsWith("p") && hour < 12) hour += 12;
+  if (meridiem.startsWith("a") && hour === 12) hour = 0;
+  return { hour, minute };
+}
+
+function easternOffsetForMonth(month) {
+  return month >= 3 && month <= 10 ? "-04:00" : "-05:00";
 }

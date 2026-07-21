@@ -1,6 +1,6 @@
 import { moveOldOpenItemsToHistory, pool } from "./db.js";
 import { config } from "./config.js";
-import { analyzeDocument, extractNotice, looksLikeCourtNotice } from "./extract.js";
+import { analyzeDocument, extractNotice, looksLikeCourtNotice, parseDate } from "./extract.js";
 import { gmailForRefreshToken, listCourtNoticeMessages, listIncomingMessages, readMessage } from "./gmail.js";
 
 export async function syncMailbox(mailbox) {
@@ -43,12 +43,14 @@ export async function syncMailbox(mailbox) {
     }
 
     documentCount += await backfillMissingDocuments(gmail);
+    await rereadSavedDocuments();
     await repairHtmlDocumentReads();
     documentCount += await repairHtmlLinkedDocuments();
     await backfillBlockedDocumentSummaries();
     await backfillDocumentAnalysis();
     const documentDeadlineCount = await backfillDeadlinesFromReadDocuments();
     deadlineCount += documentDeadlineCount;
+    await normalizeExistingDeadlineDates();
     const historyMove = await moveOldOpenItemsToHistory();
 
     await pool.query("update mailboxes set last_sync_at = now(), updated_at = now() where email = $1", [mailbox.email]);
@@ -68,9 +70,11 @@ export async function syncMailbox(mailbox) {
 
 export async function retryBlockedDocuments() {
   const repaired = await repairHtmlLinkedDocuments();
+  await rereadSavedDocuments();
   await backfillBlockedDocumentSummaries();
   await backfillDocumentAnalysis();
   const deadlineCount = await backfillDeadlinesFromReadDocuments();
+  await normalizeExistingDeadlineDates();
   return { repaired, deadlineCount };
 }
 
@@ -188,6 +192,35 @@ async function repairHtmlDocumentReads() {
   }
 }
 
+async function rereadSavedDocuments() {
+  const result = await pool.query(`
+    select id, filename, mime_type, content, read_status
+    from documents
+    where content is not null
+      and (
+        read_status is null
+        or read_status = 'pending'
+        or read_status = 'stored_unreadable'
+        or read_status like 'read_error:%'
+      )
+    order by updated_at asc nulls first, created_at asc
+    limit 300
+  `);
+
+  for (const row of result.rows) {
+    const extracted = await readDocumentText({
+      filename: row.filename,
+      mimeType: row.mime_type,
+      content: row.content
+    });
+    const analysis = await analyzeSavedDocument(row.filename, row.mime_type, extracted);
+    await pool.query(
+      "update documents set extracted_text = coalesce($1, extracted_text), read_status = $2, document_type = $3, document_summary = $4, updated_at = now() where id = $5",
+      [extracted.text, extracted.status, analysis.documentType, analysis.summary, row.id]
+    );
+  }
+}
+
 async function repairHtmlLinkedDocuments() {
   const result = await pool.query(`
     select id, filename, source_url
@@ -210,6 +243,26 @@ async function repairHtmlLinkedDocuments() {
     if (doc?.content && !String(doc?.read_status || "").startsWith("download_error:") && doc?.read_status !== "notice_read_pdf_blocked") repaired += 1;
   }
   return repaired;
+}
+
+async function normalizeExistingDeadlineDates() {
+  const result = await pool.query(`
+    select id, date_text, source_quote
+    from deadlines
+    where status = 'open'
+      and coalesce(date_text, source_quote) is not null
+    order by created_at desc
+    limit 2000
+  `);
+
+  for (const row of result.rows) {
+    const parsed = parseDate(row.date_text || row.source_quote || "");
+    if (!parsed) continue;
+    await pool.query(
+      "update deadlines set due_at = $1 where id = $2 and (due_at is distinct from $1::timestamptz)",
+      [parsed, row.id]
+    );
+  }
 }
 
 async function backfillDocumentAnalysis() {
