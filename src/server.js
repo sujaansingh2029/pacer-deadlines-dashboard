@@ -4,10 +4,10 @@ import crypto from "crypto";
 import multer from "multer";
 import OpenAI from "openai";
 import { assertRequiredConfig, config } from "./config.js";
-import { initDb, moveOldOpenItemsToHistory, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
+import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { analyzeDocument, extractNotice } from "./extract.js";
 import { authUrl, exchangeCode } from "./gmail.js";
-import { readDocumentText, refreshDocumentFromSource, retryBlockedDocuments, syncMailbox } from "./sync.js";
+import { readDocumentText, refreshDocumentFromSource, retryBlockedDocuments, syncMailbox, testPacerConnection } from "./sync.js";
 
 const app = express();
 const upload = multer({
@@ -74,10 +74,7 @@ app.get("/", asyncRoute(async (req, res) => {
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
 
-  await moveOldOpenItemsToHistory();
-
-  const [deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats] = await Promise.all([
-    pool.query(`
+  const deadlines = await pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
@@ -85,10 +82,10 @@ app.get("/", asyncRoute(async (req, res) => {
       where d.status = 'open'
       order by d.due_at nulls last, d.created_at desc
       limit 50
-    `),
-    deadlineWindowQuery(0, 1),
-    deadlineWindowQuery(1, 2),
-    pool.query(`
+    `);
+  const dueToday = await deadlineWindowQuery(0, 1);
+  const dueTomorrow = await deadlineWindowQuery(1, 2);
+  const overdue = await pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
@@ -98,8 +95,8 @@ app.get("/", asyncRoute(async (req, res) => {
         and d.due_at < (date_trunc('day', now() at time zone 'America/New_York') at time zone 'America/New_York')
       order by d.due_at asc
       limit 25
-    `),
-    pool.query(`
+    `);
+  const needsReview = await pool.query(`
       select d.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from deadlines d
       join cases c on c.id = d.case_id
@@ -108,8 +105,8 @@ app.get("/", asyncRoute(async (req, res) => {
         and d.due_at is null
       order by d.created_at desc
       limit 25
-    `),
-    pool.query(`
+    `);
+  const events = await pool.query(`
       select de.*, c.case_name, c.court, c.case_number, e.subject, e.received_at
       from docket_events de
       join cases c on c.id = de.case_id
@@ -117,34 +114,47 @@ app.get("/", asyncRoute(async (req, res) => {
       where de.status = 'open'
       order by de.source_received_at desc nulls last, de.created_at desc
       limit 50
-    `),
-    pool.query(`
+    `);
+  const cases = await pool.query(`
       select
         c.*,
-        min(d.due_at) filter (where d.status = 'open' and d.due_at is not null) as next_deadline_at,
-        count(distinct d.id) filter (where d.status = 'open') as open_deadline_count,
-        count(distinct de.id) filter (where de.status = 'open') as open_event_count,
-        max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at,
-        max(e.received_at) as latest_notice_received_at
+        ds.next_deadline_at,
+        coalesce(ds.open_deadline_count, 0) as open_deadline_count,
+        coalesce(es.open_event_count, 0) as open_event_count,
+        es.latest_activity_at,
+        es.latest_notice_received_at
       from cases c
-      left join deadlines d on d.case_id = c.id
-      left join docket_events de on de.case_id = c.id
-      left join documents doc on doc.case_id = c.id
-      left join emails e on e.gmail_id = de.gmail_id or e.gmail_id = d.gmail_id or e.gmail_id = doc.gmail_id
-      group by c.id
+      left join (
+        select case_id,
+               min(due_at) filter (where due_at is not null) as next_deadline_at,
+               count(*) as open_deadline_count
+        from deadlines
+        where status = 'open'
+        group by case_id
+      ) ds on ds.case_id = c.id
+      left join (
+        select de.case_id,
+               count(*) as open_event_count,
+               max(coalesce(de.source_received_at, de.created_at)) as latest_activity_at,
+               max(e.received_at) as latest_notice_received_at
+        from docket_events de
+        left join emails e on e.gmail_id = de.gmail_id
+        where de.status = 'open'
+        group by de.case_id
+      ) es on es.case_id = c.id
       order by next_deadline_at nulls last, latest_activity_at desc nulls last
-      limit 100
-    `),
-    pool.query(`
+      limit 75
+    `);
+  const documents = await pool.query(`
       select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
              doc.source_url, doc.source_type, doc.extracted_text, doc.document_type, doc.document_summary,
              doc.created_at, e.subject, e.received_at
       from documents doc
       left join emails e on e.gmail_id = doc.gmail_id
       order by doc.created_at desc
-      limit 1000
-    `),
-    pool.query(`
+      limit 300
+    `);
+  const notices = await pool.query(`
       select e.gmail_id, e.from_header, e.subject, e.received_at, e.is_court_notice,
              count(distinct d.id) filter (where d.status = 'open') as open_deadlines,
              count(distinct de.id) filter (where de.status = 'open') as open_activity,
@@ -156,9 +166,9 @@ app.get("/", asyncRoute(async (req, res) => {
       where e.is_court_notice = true
       group by e.gmail_id
       order by e.received_at desc nulls last
-      limit 75
-    `),
-    pool.query(`
+      limit 50
+    `);
+  const manualReview = await pool.query(`
       select *
       from (
         select 'Email' as item_type, e.gmail_id as item_id, e.subject as title, e.from_header as detail,
@@ -167,7 +177,6 @@ app.get("/", asyncRoute(async (req, res) => {
         from emails e
         left join deadlines d on d.gmail_id = e.gmail_id and d.status = 'open'
         left join docket_events de on de.gmail_id = e.gmail_id and de.status = 'open'
-        left join cases c on c.id = de.case_id or c.id = d.case_id
         where e.is_court_notice = true
           and coalesce(e.review_status, 'open') = 'open'
           and not (
@@ -177,10 +186,7 @@ app.get("/", asyncRoute(async (req, res) => {
           )
         group by e.gmail_id
         having count(distinct d.id) = 0
-           and (
-             count(distinct de.id) = 0
-             or count(distinct c.id) filter (where c.case_name is not null or c.case_number is not null) = 0
-           )
+           and count(distinct de.id) = 0
         union all
         select 'Document' as item_type, doc.id::text as item_id, doc.filename as title,
                coalesce(c.case_name, 'Case pending review') as detail,
@@ -197,9 +203,9 @@ app.get("/", asyncRoute(async (req, res) => {
           )
       ) review_items
       order by review_items.received_at desc nulls last
-      limit 75
-    `),
-    pool.query(`
+      limit 50
+    `);
+  const blockedDocuments = await pool.query(`
       select doc.id, doc.filename, doc.read_status, doc.source_url, doc.document_summary,
              coalesce(c.case_name, 'Case pending review') as case_name,
              coalesce(e.received_at, doc.created_at) as received_at
@@ -212,11 +218,11 @@ app.get("/", asyncRoute(async (req, res) => {
           or doc.read_status = 'notice_read_pdf_blocked'
         )
       order by coalesce(e.received_at, doc.created_at) desc
-      limit 100
-    `),
-    loadHistoryItems(),
-    pool.query("select * from sync_runs order by started_at desc limit 5"),
-    pool.query(`
+      limit 50
+    `);
+  const historyItems = await loadHistoryItems();
+  const runs = await pool.query("select * from sync_runs order by started_at desc limit 5");
+  const stats = await pool.query(`
       select
         (select count(*) from deadlines where status = 'open') as open_deadlines,
         (select count(*) from deadlines where status = 'open' and due_at is not null and due_at <= now() + interval '7 days') as due_soon,
@@ -228,8 +234,7 @@ app.get("/", asyncRoute(async (req, res) => {
         (select count(*) from documents where read_status = 'read') as read_documents,
         (select count(*) from documents where read_status <> 'read') as unread_documents,
         ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open') + (select count(*) from emails where coalesce(review_status, 'open') <> 'open') + (select count(*) from documents where coalesce(review_status, 'open') <> 'open')) as history_items
-    `)
-  ]);
+    `);
 
   res.send(layout("PACER Deadlines Dashboard", dashboardHtml({
     mailbox,
@@ -404,6 +409,17 @@ app.post("/documents/retry-blocked", asyncRoute(async (req, res) => {
   res.redirect(req.get("referer") || "/");
 }));
 
+app.post("/documents/:id/retry", asyncRoute(async (req, res) => {
+  await waitForDatabase();
+  await refreshDocumentFromSource(req.params.id);
+  res.redirect(`/documents/${req.params.id}/view`);
+}));
+
+app.post("/pacer-test", asyncRoute(async (_req, res) => {
+  const result = await testPacerConnection();
+  res.send(layout("PACER Connection Check", pacerTestResultHtml(result)));
+}));
+
 app.post("/cases/:id/documents", upload.single("document"), asyncRoute(async (req, res) => {
   await waitForDatabase();
   const caseId = Number(req.params.id);
@@ -516,7 +532,13 @@ app.get("/documents/:id/view", asyncRoute(async (req, res) => {
 
 async function loadDocumentForServing(id) {
   const result = await pool.query(
-    "select id, filename, mime_type, content, source_url, source_type, read_status, document_type, document_summary from documents where id = $1",
+    `select doc.id, doc.filename, doc.mime_type, doc.content, doc.source_url, doc.source_type,
+            doc.read_status, doc.document_type, doc.document_summary,
+            c.case_name, c.case_number, c.court, e.received_at
+     from documents doc
+     left join cases c on c.id = doc.case_id
+     left join emails e on e.gmail_id = doc.gmail_id
+     where doc.id = $1`,
     [id]
   );
   let doc = result.rows[0];
@@ -547,19 +569,51 @@ function isServableDocument(doc) {
 
 function documentUnavailableHtml(doc, action) {
   const title = action === "download" ? "Document is not ready to download" : "Document is not ready to view";
+  const reason = readableDocumentBlockReason(doc);
+  const details = doc.document_summary || doc.read_status || "PACER returned a page instead of a readable PDF.";
   return layout(
     title,
-    `<section class="panel narrow">
-      <div class="panel-body">
-        <h1>${title}</h1>
-        <p>The dashboard read the court email, but PACER has not released the actual PDF to the server yet.</p>
-        ${doc.document_summary ? `<p>${escapeHtml(doc.document_summary)}</p>` : ""}
-        <p>The app will retry this document automatically during hourly sync. You can also retry it now after confirming the PACER username, password, client code, and fee approval settings in Render.</p>
-        <form method="post" action="/documents/retry-blocked" class="inline-action-form"><button type="submit">Retry PACER Fetch</button></form>
-        <a class="button secondary" href="/">Back to dashboard</a>
+    `<section class="panel document-status-page">
+      <div class="panel-body document-status-card">
+        <div>
+          <div class="eyebrow">PACER Document</div>
+          <div class="document-status-title">${title}</div>
+          <div class="muted">${escapeHtml(doc.filename || "Court document")}</div>
+        </div>
+        <div class="document-status-box">
+          <div><strong>Status:</strong> ${documentStatusTag(doc)}</div>
+          <div><strong>Case:</strong> ${escapeHtml(doc.case_name || "Case pending review")}${doc.case_number ? ` | ${escapeHtml(doc.case_number)}` : ""}</div>
+          ${doc.received_at ? `<div><strong>Email received:</strong> ${formatDate(doc.received_at)}</div>` : ""}
+          <div><strong>What happened:</strong> ${escapeHtml(reason)}</div>
+        </div>
+        <p>The dashboard saved the court email details. It will keep retrying the PACER PDF during hourly sync. If PACER requires a login, client code, or fee approval, confirm those settings in Render first.</p>
+        <div class="button-row">
+          <form method="post" action="/documents/${doc.id}/retry"><button type="submit">Retry This PDF</button></form>
+          <form method="post" action="/pacer-test"><button class="secondary" type="submit">Check PACER Login</button></form>
+          <a class="button secondary" href="/">Back to dashboard</a>
+        </div>
+        <details class="technical-details">
+          <summary>Show court email details</summary>
+          <div class="document-preview">${escapeHtml(details)}</div>
+        </details>
       </div>
     </section>`
   );
+}
+
+function readableDocumentBlockReason(doc) {
+  const status = String(doc.read_status || "");
+  const summary = String(doc.document_summary || "");
+  if (/fee|charge|billing/i.test(`${status}\n${summary}`)) {
+    return "PACER is asking for fee approval before releasing the PDF.";
+  }
+  if (/login|authenticate|password|username/i.test(`${status}\n${summary}`)) {
+    return "PACER did not accept the login for this document request.";
+  }
+  if (doc.source_type === "ecf_link") {
+    return "The court link returned an HTML page instead of the actual PDF.";
+  }
+  return "The saved file is not ready for preview yet.";
 }
 
 app.post("/api/chat", asyncRoute(async (req, res) => {
@@ -670,8 +724,8 @@ function layout(title, body) {
     .eyebrow { color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }
     .toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
     .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
-    .due-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
-    .due-card { background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-height: 120px; }
+    .due-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .due-card { background: #fff; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; min-height: 96px; }
     .due-card.overdue { border-color: #fda29b; }
     .due-card.today { border-color: #f79009; }
     .due-card.tomorrow { border-color: #84caff; }
@@ -685,7 +739,7 @@ function layout(title, body) {
     .metric strong { display: block; font-size: 26px; line-height: 1; margin-top: 8px; }
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
     .stack { display: grid; gap: 16px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-bottom: 12px; }
     .priority-panel { border-color: #f79009; box-shadow: 0 0 0 1px rgba(247, 144, 9, .14); }
     .priority-panel .panel-head { background: #fffbeb; }
     .start-panel { margin-bottom: 16px; }
@@ -697,7 +751,23 @@ function layout(title, body) {
     .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .panel-body { padding: 10px 14px; }
     .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
+    .compact-notice { margin-bottom: 0; padding: 9px 12px; font-size: 13px; }
     .snapshot { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr); gap: 14px; margin-bottom: 16px; }
+    .command-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .command-card { border: 1px solid #e4e7ec; border-radius: 8px; background: #fff; padding: 12px; display: grid; gap: 6px; min-height: 86px; }
+    .command-card.urgent { border-color: #fda29b; background: #fff7f7; }
+    .command-card.today { border-color: #f79009; background: #fffbeb; }
+    .command-card.good { border-color: #abefc6; background: #f6fef9; }
+    .command-card.waiting { border-color: #84caff; background: #f5fbff; }
+    .command-label { color: var(--muted); font-size: 12px; font-weight: 900; text-transform: uppercase; letter-spacing: .04em; }
+    .command-value { font-size: 26px; font-weight: 950; line-height: 1; }
+    .command-title { font-size: 15px; font-weight: 900; line-height: 1.25; }
+    .command-text { color: var(--muted); font-size: 13px; line-height: 1.35; }
+    .status-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
+    .status-card { border: 1px solid #e4e7ec; border-radius: 8px; background: #fff; padding: 13px; display: grid; gap: 6px; }
+    .status-card.good { border-color: #abefc6; background: #f6fef9; }
+    .status-card.warn { border-color: #fedf89; background: #fffbeb; }
+    .status-card.bad { border-color: #fda29b; background: #fff7f7; }
     .summary-list { margin: 0; padding-left: 20px; display: grid; gap: 8px; }
     .summary-list li { line-height: 1.35; }
     .simple-counts { display: grid; gap: 8px; }
@@ -705,6 +775,10 @@ function layout(title, body) {
     .simple-count strong { font-size: 20px; }
     details.panel summary { list-style: none; cursor: pointer; }
     details.panel summary::-webkit-details-marker { display: none; }
+    .main-panel { margin-bottom: 12px; }
+    .more-details { margin-top: 4px; }
+    .more-stack { display: grid; gap: 12px; padding: 12px; }
+    .more-stack > .panel { margin-bottom: 0; }
     .section-note { padding: 10px 14px; border-bottom: 1px solid #edf0f5; color: var(--muted); font-size: 13px; }
     .inline-action-form { padding: 10px 14px; border-bottom: 1px solid #edf0f5; margin: 0; }
     .inline-action-form button { padding: 8px 11px; }
@@ -746,6 +820,15 @@ function layout(title, body) {
     .document-viewer summary::-webkit-details-marker { display: none; }
     .pdf-frame { width: 100%; height: min(72vh, 760px); border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; margin-top: 8px; }
     .document-unavailable { margin-top: 10px; border-top: 1px solid #edf0f5; padding-top: 8px; color: var(--muted); font-size: 12px; }
+    .document-status-page { max-width: 860px; margin: 0 auto; }
+    .document-status-card { display: grid; gap: 14px; }
+    .document-status-title { font-size: 24px; font-weight: 950; line-height: 1.15; }
+    .document-status-box { border: 1px solid #e4e7ec; border-radius: 8px; background: #f8fafc; padding: 12px; display: grid; gap: 6px; }
+    .button-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .button-row form { margin: 0; }
+    .technical-details { border-top: 1px solid #edf0f5; padding-top: 12px; }
+    .technical-details summary { cursor: pointer; color: var(--blue); font-weight: 900; list-style: none; }
+    .technical-details summary::-webkit-details-marker { display: none; }
     .upload-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; border: 1px dashed #b8c7e6; border-radius: 8px; padding: 8px; background: #f8fbff; }
     .upload-form input { max-width: 280px; font-size: 12px; color: var(--muted); }
     .upload-form button { padding: 7px 10px; font-size: 12px; }
@@ -801,7 +884,7 @@ function layout(title, body) {
     .prompt-chip { background: #ffffff; color: #344054; border: 1px solid #d0d5dd; border-radius: 999px; padding: 6px 9px; font-weight: 700; font-size: 12px; }
     .prompt-chip:hover { border-color: var(--blue); color: var(--blue); }
     input[type=password] { box-sizing: border-box; width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
-    @media (max-width: 980px) { .layout, .summary, .snapshot, .steps, .due-strip, .deadline-card, .case-deadline-row, .calendar-item { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } .calendar-grid { gap: 4px; } .calendar-button { min-height: 54px; padding: 6px; } }
+    @media (max-width: 980px) { .layout, .summary, .snapshot, .command-grid, .status-grid, .steps, .due-strip, .deadline-card, .case-deadline-row, .calendar-item { grid-template-columns: 1fr; } header { align-items: flex-start; flex-direction: column; } table { table-layout: auto; } .deadline-card { gap: 8px; } .calendar-grid { gap: 4px; } .calendar-button { min-height: 54px; padding: 6px; } }
   </style>
 </head>
 <body>
@@ -895,10 +978,22 @@ function loginHtml(hasError) {
   </div>`;
 }
 
+function pacerTestResultHtml(result) {
+  return `<section class="panel">
+    <div class="panel-head"><h2>${result.ok ? "PACER login looks connected" : "PACER login needs attention"}</h2></div>
+    <div class="panel-body">
+      <p>${escapeHtml(result.summary || "PACER check finished.")}</p>
+      <p class="muted">This checks the PACER login settings visible to the running app. It does not guarantee every court document will be released, because some ECF links require fee approval, court-specific prompts, or an unexpired free-look link.</p>
+      <a class="button" href="/">Back to dashboard</a>
+    </div>
+  </section>`;
+}
+
 function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats, calendarMonth }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   const calendarItems = buildCalendarItems(deadlines);
   const meetingItems = calendarItems.filter((item) => item.kind === "Meeting");
+  const pacerState = pacerConnectionState(blockedDocuments, stats);
   return `
     <div class="toolbar" style="justify-content:space-between;margin-bottom:16px">
       <div>
@@ -907,38 +1002,39 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
       </div>
       <form method="post" action="/sync-now"><button type="submit">Sync Now</button></form>
     </div>
-    ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
+    ${commandCenterPanel({ dueToday, dueTomorrow, needsReview, blockedDocuments, stats })}
+    ${systemStatusPanel({ pacerState, runs, stats })}
     ${dueNowPanel({ overdue, dueToday, dueTomorrow })}
     ${meetingPanel(meetingItems)}
-    <div class="snapshot">
-      <section class="panel">
-        <div class="panel-head">
-          <div><h2>Today's Summary</h2><div class="muted">${escapeHtml(runSummary)}</div></div>
-        </div>
-        <div class="panel-body">
-          ${summaryList({ deadlines, needsReview, events, cases, stats })}
-        </div>
-      </section>
-      <section class="panel">
-        <div class="panel-head"><h2>At A Glance</h2></div>
-        <div class="panel-body simple-counts">
-          ${simpleCount("Due today", stats.due_today)}
-          ${simpleCount("Due tomorrow", stats.due_tomorrow)}
-          ${simpleCount("Meetings", meetingItems.length)}
-          ${simpleCount("Needs a person", manualReview.length)}
-          ${simpleCount("PACER waiting", blockedDocuments.length)}
-          ${simpleCount("Due in 7 days", stats.due_soon)}
-          ${simpleCount("Missing exact date", stats.needs_review)}
-          ${simpleCount("Open deadlines", stats.open_deadlines)}
-          ${simpleCount("PDFs read", stats.read_documents)}
-          ${simpleCount("History", stats.history_items)}
-        </div>
-      </section>
-    </div>
-    <div class="notice">The dashboard reads court emails every hour, saves anything it can read, and flags what needs a person. Always verify extracted deadlines against the docket and rules before relying on them.</div>
-    <div class="layout">
-      <div class="stack">
-        ${manualReviewSection(manualReview)}
+    ${manualReview.length ? manualReviewSection(manualReview) : ""}
+    ${blockedDocuments.length ? blockedDocumentSection(blockedDocuments) : ""}
+    <section class="panel main-panel">
+      <div class="panel-head">
+        <div><h2>Cases & Documents</h2><div class="muted">Open one case to see due dates, court notices, PDFs, and uploads.</div></div>
+      </div>
+      <div class="panel-body">${caseCards(cases, documents, deadlines)}</div>
+    </section>
+    <section class="panel main-panel">
+      <div class="panel-head">
+        <div><h2>Ask AI</h2><div class="muted">Ask about deadlines, meetings, documents, or one active case.</div></div>
+      </div>
+      <div class="panel-body">${chatPanel()}</div>
+    </section>
+    <details class="panel more-details">
+      <summary class="panel-head">
+        <div><h2>More Details</h2><div class="muted">Calendar, full notice list, history, and sync logs are here when you need them.</div></div>
+        <span class="muted">Open</span>
+      </summary>
+      <div class="more-stack">
+        <div class="notice compact-notice">The dashboard checks the mailbox every hour and scans saved documents. Verify extracted legal deadlines against the docket and rules before relying on them.</div>
+        <section class="panel">
+          <div class="panel-head">
+            <div><h2>Today's Summary</h2><div class="muted">${escapeHtml(runSummary)}</div></div>
+          </div>
+          <div class="panel-body">
+            ${summaryList({ deadlines, needsReview, events, cases, stats })}
+          </div>
+        </section>
         <details class="panel">
           <summary class="panel-head">
             <div><h2>Missing Exact Date</h2><div class="muted">Items with relative or unclear timing. These are not shown as due today or tomorrow until an exact date is known.</div></div>
@@ -959,25 +1055,12 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           </div>
           ${noticeTable(notices)}
         </section>
-        ${blockedDocumentSection(blockedDocuments)}
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>Cases & Documents</h2><div class="muted">Open a case for due dates, notices, saved documents, and uploads.</div></div>
-          </div>
-          <div class="panel-body">${caseCards(cases, documents, deadlines)}</div>
-        </section>
-        <section class="panel">
-          <div class="panel-head">
-            <div><h2>Ask AI</h2><div class="muted">Ask plain-English questions about upcoming work</div></div>
-          </div>
-          <div class="panel-body">${chatPanel()}</div>
-        </section>
         <details class="panel">
           <summary class="panel-head"><h2>Recent Court Activity</h2><span class="muted">Open</span></summary>
           <div class="section-note">Check an item when it has been reviewed and handled.</div>
           ${activityList(events)}
         </details>
-        <details class="panel" open>
+        <details class="panel">
           <summary class="panel-head"><div><h2>History</h2><div class="muted">Checked-off items and anything automatically moved here after 5 days.</div></div><span class="muted">Open</span></summary>
           ${historyTable(historyItems)}
         </details>
@@ -996,7 +1079,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           )}
         </details>
       </div>
-    </div>
+    </details>
   `;
 }
 
@@ -1006,6 +1089,83 @@ function dueNowPanel({ overdue, dueToday, dueTomorrow }) {
     ${dueBucket("Due Today", dueToday, "today", "Handle before the end of today")}
     ${dueBucket("Due Tomorrow", dueTomorrow, "tomorrow", "Prepare now so tomorrow is calm")}
   </section>`;
+}
+
+function commandCenterPanel({ dueToday, dueTomorrow, needsReview, blockedDocuments, stats }) {
+  const todayCount = Number(stats.due_today || dueToday.length || 0);
+  const tomorrowCount = Number(stats.due_tomorrow || dueTomorrow.length || 0);
+  const missingDateCount = Number(stats.needs_review || needsReview.length || 0);
+  const pacerWaitingCount = blockedDocuments.length;
+  return `<section class="command-grid">
+    ${commandCard("Do today", todayCount, todayCount ? "Deadlines due today" : "Nothing due today", todayCount ? "Handle these first." : "No same-day deadline found.", todayCount ? "today" : "good")}
+    ${commandCard("Tomorrow", tomorrowCount, tomorrowCount ? "Deadlines due tomorrow" : "Nothing due tomorrow", tomorrowCount ? "Prepare these now." : "Tomorrow looks clear.", tomorrowCount ? "waiting" : "good")}
+    ${commandCard("PACER PDFs", pacerWaitingCount, pacerWaitingCount ? "Waiting on PACER" : "PDFs look good", pacerWaitingCount ? "Retry fetch after PACER login/fees are confirmed." : "No blocked PACER PDF requests on the first page.", pacerWaitingCount ? "urgent" : "good")}
+    ${commandCard("Need exact date", missingDateCount, missingDateCount ? "Dates need cleanup" : "Dates look clean", missingDateCount ? "These have relative dates like 'within 14 days'." : "No open extracted item is missing a date.", missingDateCount ? "today" : "good")}
+  </section>`;
+}
+
+function commandCard(label, value, title, text, tone) {
+  return `<div class="command-card ${tone}">
+    <div class="command-label">${escapeHtml(label)}</div>
+    <div class="command-value">${Number(value || 0)}</div>
+    <div class="command-title">${escapeHtml(title)}</div>
+    <div class="command-text">${escapeHtml(text)}</div>
+  </div>`;
+}
+
+function systemStatusPanel({ pacerState, runs, stats }) {
+  const lastRun = runs[0];
+  const totalDocs = Number(stats.documents || 0);
+  const readDocs = Number(stats.read_documents || 0);
+  const readText = totalDocs ? `${readDocs} of ${totalDocs} saved document(s) readable` : "No saved documents yet";
+  const syncText = lastRun
+    ? `${lastRun.error ? "Last sync had an error" : "Last sync finished"}: ${formatDate(lastRun.finished_at || lastRun.started_at)}`
+    : "No sync has run yet";
+  return `<section class="status-grid">
+    <div class="status-card ${pacerState.tone}">
+      <div class="command-label">PACER</div>
+      <div class="command-title">${escapeHtml(pacerState.title)}</div>
+      <div class="command-text">${escapeHtml(pacerState.text)}</div>
+      <form method="post" action="/pacer-test" style="margin:4px 0 0"><button class="secondary" type="submit">Check PACER Login</button></form>
+    </div>
+    <div class="status-card ${readDocs ? "good" : "warn"}">
+      <div class="command-label">Documents</div>
+      <div class="command-title">${escapeHtml(readText)}</div>
+      <div class="command-text">Readable PDFs are scanned for deadlines and grouped under each case.</div>
+    </div>
+    <div class="status-card ${lastRun?.error ? "bad" : "good"}">
+      <div class="command-label">Sync</div>
+      <div class="command-title">${escapeHtml(syncText)}</div>
+      <div class="command-text">The cron job checks the mailbox every hour. Use Sync Now for an immediate refresh.</div>
+    </div>
+  </section>`;
+}
+
+function pacerConnectionState(blockedDocuments, stats) {
+  const hasLogin = Boolean(config.pacerUsername && config.pacerPassword);
+  const hasCookie = Boolean(config.pacerAuthCookie);
+  const unreadDocs = Number(stats.unread_documents || 0);
+  if (!hasLogin && !hasCookie) {
+    return {
+      tone: "bad",
+      title: "PACER login missing",
+      text: "Add PACER_USERNAME and PACER_PASSWORD to both Render services so PDFs can be fetched."
+    };
+  }
+  if (blockedDocuments.length) {
+    return {
+      tone: config.pacerAutoAcceptFees ? "warn" : "bad",
+      title: config.pacerAutoAcceptFees ? "PACER connected, PDFs still blocked" : "PACER needs fee setting",
+      text: config.pacerAutoAcceptFees
+        ? `${blockedDocuments.length} document(s) still returned an HTML/login/fee page. Press Retry PACER Fetch after deploy.`
+        : `${blockedDocuments.length} PDF(s) are waiting. If PACER asks for fees, set PACER_AUTO_ACCEPT_FEES=true only if you approve charges.`
+    };
+  }
+  return {
+    tone: unreadDocs ? "warn" : "good",
+    title: hasLogin ? "PACER login configured" : "PACER cookie configured",
+    text: unreadDocs ? `${unreadDocs} saved document(s) still need text extraction.` : "No blocked PACER PDF requests are visible right now."
+  };
 }
 
 function dueBucket(title, items, tone, emptyText) {
@@ -1094,20 +1254,24 @@ function blockedDocumentSection(documents) {
       <div><h2>PACER Waiting For PDFs</h2><div class="muted">${documents.length} court document(s) did not return a readable PDF yet.</div></div>
       <span class="muted">Open</span>
     </summary>
-    <div class="section-note">${pacerStatusText()} The app retries these links every hour and when you press the button. If the reason mentions fees, set PACER_AUTO_ACCEPT_FEES=true in both Render services only if you approve PACER charges.</div>
+    <div class="section-note">${pacerStatusText()} The app retries these links every hour and when you press the button. If PACER asks for a fee, turn on PACER_AUTO_ACCEPT_FEES only if the firm approves PACER charges.</div>
     <form method="post" action="/documents/retry-blocked" class="inline-action-form">
       <button type="submit">Retry PACER Fetch</button>
     </form>
-    ${table(
-      ["Done", "Received", "Case", "Document", "Status"],
-      documents.map((doc) => [
-        archiveButton(`/documents/${doc.id}/archive`, "Move document request to history"),
-        `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
-        escapeHtml(doc.case_name || "Case pending review"),
-        `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
-        `${documentStatusTag(doc)}<br><span class="muted">${escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")}</span>`
-      ])
-    )}
+    <div class="deadline-cards">
+      ${documents.map((doc) => `<div class="deadline-card">
+        <div>${archiveButton(`/documents/${doc.id}/archive`, "Move document request to history")}</div>
+        <div class="deadline-main">
+          <div class="deadline-when">
+            ${documentStatusTag(doc)}
+            <span class="muted">Email received: ${formatDate(doc.received_at) || "Review date pending"}</span>
+          </div>
+          <div class="deadline-title">${escapeHtml(doc.filename || "PACER document")}</div>
+          <div class="deadline-case">${escapeHtml(doc.case_name || "Case pending review")}</div>
+          <div class="deadline-source">${escapeHtml(doc.document_summary || "PACER returned a web page instead of a readable PDF. The app will retry automatically on the next sync.")}</div>
+        </div>
+      </div>`).join("")}
+    </div>
   </details>`;
 }
 

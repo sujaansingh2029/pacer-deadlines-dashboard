@@ -4,13 +4,21 @@ import { analyzeDocument, extractNotice, looksLikeCourtNotice, parseDate } from 
 import { gmailForRefreshToken, listCourtNoticeMessages, listIncomingMessages, readMessage } from "./gmail.js";
 
 export async function syncMailbox(mailbox) {
-  const run = await pool.query(
-    "insert into sync_runs (mailbox_email) values ($1) returning id, started_at",
-    [mailbox.email]
-  );
-  const runId = run.rows[0].id;
+  const syncLock = await acquireSyncLock();
+  if (!syncLock.locked) {
+    const summary = "Another mailbox sync is already running. Skipped this run to avoid database locks.";
+    return { scanned: 0, notices: 0, deadlineCount: 0, documentCount: 0, summary };
+  }
+
+  let runId = null;
 
   try {
+    const run = await pool.query(
+      "insert into sync_runs (mailbox_email) values ($1) returning id, started_at",
+      [mailbox.email]
+    );
+    runId = run.rows[0].id;
+
     const gmail = gmailForRefreshToken(mailbox.refresh_token);
     const afterUnix = mailbox.last_sync_at
       ? Math.floor(new Date(mailbox.last_sync_at).getTime() / 1000)
@@ -74,7 +82,34 @@ export async function syncMailbox(mailbox) {
     );
     return { scanned, notices, deadlineCount, documentCount, summary };
   } catch (error) {
-    await pool.query("update sync_runs set finished_at = now(), error = $1 where id = $2", [error.stack || error.message, runId]);
+    if (runId) {
+      await pool.query("update sync_runs set finished_at = now(), error = $1 where id = $2", [error.stack || error.message, runId]);
+    }
+    throw error;
+  } finally {
+    await syncLock.release();
+  }
+}
+
+async function acquireSyncLock() {
+  const client = await pool.connect();
+  try {
+    const result = await client.query("select pg_try_advisory_lock(72623391) as locked");
+    const locked = Boolean(result.rows[0]?.locked);
+    if (!locked) client.release();
+    return {
+      locked,
+      release: async () => {
+        if (!locked) return;
+        try {
+          await client.query("select pg_advisory_unlock(72623391)");
+        } finally {
+          client.release();
+        }
+      }
+    };
+  } catch (error) {
+    client.release();
     throw error;
   }
 }
@@ -87,6 +122,28 @@ export async function retryBlockedDocuments() {
   const deadlineCount = await backfillDeadlinesFromReadDocuments();
   await normalizeExistingDeadlineDates();
   return { repaired, deadlineCount };
+}
+
+export async function testPacerConnection() {
+  if (config.pacerAuthCookie && !(config.pacerUsername && config.pacerPassword)) {
+    return {
+      ok: true,
+      summary: "PACER_AUTH_COOKIE is configured. The app can use that cookie for document requests, but username/password login was not tested."
+    };
+  }
+  if (!config.pacerUsername || !config.pacerPassword) {
+    return {
+      ok: false,
+      summary: "PACER username/password are missing in this Render service."
+    };
+  }
+
+  const jar = new CookieJar();
+  await loginToPacer(jar);
+  return {
+    ok: true,
+    summary: "PACER username/password login completed without an obvious login error."
+  };
 }
 
 async function processMessage(gmail, id, mailboxEmail, options = {}) {
@@ -267,18 +324,76 @@ async function normalizeExistingDeadlineDates() {
   `);
 
   for (const row of result.rows) {
-    const parsed = parseDate(row.date_text || row.source_quote || "");
+    const text = row.date_text || row.source_quote || "";
+    const parsed = parseDate(text) || parseRelativeDeadlineDate(row.date_text, row.source_quote);
     if (!parsed) continue;
     await pool.query(
       `update deadlines
        set due_at = $1,
            confidence = case when confidence = 'needs_review' then 'medium' else confidence end,
-           label = regexp_replace(label, '^Possible ', '', 'i')
+           label = regexp_replace(regexp_replace(label, '^Possible ', '', 'i'), '^Needs exact date:\\s*', '', 'i')
        where id = $2
-         and (due_at is distinct from $1::timestamptz or confidence = 'needs_review' or label ~* '^Possible ')`,
+         and (due_at is distinct from $1::timestamptz or confidence = 'needs_review' or label ~* '^(Possible |Needs exact date:)')`,
       [parsed, row.id]
     );
   }
+}
+
+function parseRelativeDeadlineDate(dateText, sourceQuote) {
+  const text = `${dateText || ""}\n${sourceQuote || ""}`;
+  const amountMatch = text.match(/\b(?:within|no later than|not later than|on or before|before)\s+(\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|fourteen|twenty-one|twenty one|thirty)\s+(calendar\s+)?(business\s+)?days?\b/i);
+  if (!amountMatch) return null;
+
+  const days = numberWordToNumber(amountMatch[1]);
+  if (!days) return null;
+  const businessDays = Boolean(amountMatch[3]);
+  const lower = text.toLowerCase();
+  const triggerPatterns = lower.includes("entry")
+    ? [/\bentered\s+on\s+([a-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i]
+    : [
+        /\bserved\s+on\s+([a-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+        /\bfiled\s+on\s+([a-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+        /\bentered\s+on\s+([a-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i,
+        /\breceived\s+on\s+([a-z]+\s+\d{1,2},?\s+\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4})/i
+      ];
+
+  let triggerDate = null;
+  for (const pattern of triggerPatterns) {
+    triggerDate = parseDate(text.match(pattern)?.[1] || "");
+    if (triggerDate) break;
+  }
+  if (!triggerDate) return null;
+
+  const due = new Date(triggerDate);
+  due.setUTCHours(21, 0, 0, 0);
+  let remaining = days;
+  while (remaining > 0) {
+    due.setUTCDate(due.getUTCDate() + 1);
+    if (!businessDays || (due.getUTCDay() !== 0 && due.getUTCDay() !== 6)) {
+      remaining -= 1;
+    }
+  }
+  return due.toISOString();
+}
+
+function numberWordToNumber(value) {
+  const normalized = String(value || "").toLowerCase().replace("-", " ").trim();
+  const words = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    fourteen: 14,
+    "twenty one": 21,
+    thirty: 30
+  };
+  return Number(normalized) || words[normalized] || null;
 }
 
 async function backfillDocumentAnalysis() {
@@ -651,12 +766,24 @@ function summarizeLinkedDocumentNotice(context) {
   const docDescription = firstContextMatch(text, /Document description:\s*([^]*?)(?:Original filename:|Docket Text:|$)/i);
   const docketText = firstContextMatch(text, /Docket Text:\s*([^]*?)(?:The following document|Document description:|$)/i);
   const documentNumber = firstContextMatch(text, /Document Number:\s*([^\n\r]+)/i);
+  const documentUrl = firstContextMatch(text, /Copy the URL address[^:]*:\s*(https?:\/\/\S+)/i);
   const pieces = [];
   if (documentNumber) pieces.push(`Document number: ${documentNumber}.`);
-  if (docDescription) pieces.push(`Description from court email: ${docDescription}.`);
-  if (docketText) pieces.push(`Docket text from court email: ${docketText}.`);
-  pieces.push("The court email was read, but PACER has not released the actual PDF to the server yet. The dashboard will retry this link automatically during hourly sync.");
-  return pieces.join(" ").slice(0, 1200);
+  if (docDescription) pieces.push(`Court description: ${cleanCourtSnippet(docDescription)}.`);
+  if (docketText) pieces.push(`Docket text: ${cleanCourtSnippet(docketText)}.`);
+  if (documentUrl) pieces.push("The ECF document link was found.");
+  pieces.push("PACER returned a web page instead of the PDF. The dashboard will retry this link automatically during hourly sync.");
+  return pieces.join(" ").slice(0, 900);
+}
+
+function cleanCourtSnippet(value) {
+  return String(value || "")
+    .replace(/https?:\/\/\S+/gi, "[ECF link]")
+    .replace(/Copy the URL address.*?(?:Docket Text:|Document description:|$)/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 360);
 }
 
 function linkedDocumentStatus(downloadStatus, readStatus, fallbackSummary) {
