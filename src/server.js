@@ -17,6 +17,7 @@ const upload = multer({
 let dbReady = Promise.resolve();
 let dbStartupError = null;
 let dbStatus = config.databaseUrl ? "starting" : "missing";
+const dbStartedAt = new Date();
 
 async function waitForDatabase() {
   await dbReady;
@@ -782,16 +783,20 @@ function databaseErrorHtml(error) {
       <p>The dashboard opened its web port, but it could not connect to the Render database yet.</p>
       <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
       <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>. In Render, this should come from the database connection string, not a manually typed placeholder.</p>
+      <p class="muted">If Render is deploying from GitHub, make sure the GitHub repo contains this Node app at the repo root: package.json, render.yaml, and the src folder.</p>
     </div>
   </div>`;
 }
 
 function databaseStartingHtml() {
+  const seconds = Math.max(0, Math.round((Date.now() - dbStartedAt.getTime()) / 1000));
   return `<div class="panel">
     <div class="panel-head"><h2>Dashboard is starting</h2></div>
     <div class="panel-body">
       <p>The web service is online. It is connecting to the Render database now.</p>
-      <p class="muted">Refresh this page in about 30 seconds. If it stays here for several minutes, check the Render logs and confirm DATABASE_URL points to pacer-deadlines-db.</p>
+      <p class="muted">Database status: ${escapeHtml(dbStatus)}. Waiting for ${seconds} second(s).</p>
+      <p class="muted">Refresh this page in about 30 seconds. If it stays here for more than 2 minutes, check the Render web service environment and confirm DATABASE_URL points to pacer-deadlines-db.</p>
+      <p class="muted">If Render is connected to GitHub, it will deploy whatever is in GitHub, not the zip. If you uploaded the zip manually, GitHub files do not matter for this deploy.</p>
     </div>
   </div>`;
 }

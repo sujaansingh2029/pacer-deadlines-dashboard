@@ -7,7 +7,9 @@ export const pool = new Pool({
   connectionString: config.databaseUrl,
   ssl: config.databaseUrl?.includes("localhost") ? false : { rejectUnauthorized: false },
   connectionTimeoutMillis: 20000,
-  idleTimeoutMillis: 30000
+  idleTimeoutMillis: 30000,
+  query_timeout: 120000,
+  statement_timeout: 120000
 });
 
 export async function initDb() {
