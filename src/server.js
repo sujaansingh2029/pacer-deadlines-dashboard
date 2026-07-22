@@ -7,7 +7,7 @@ import { assertRequiredConfig, config } from "./config.js";
 import { initDb, pool, upsertMailbox, getPrimaryMailbox } from "./db.js";
 import { analyzeDocument, extractNotice } from "./extract.js";
 import { authUrl, exchangeCode } from "./gmail.js";
-import { readDocumentText, refreshDocumentFromSource, retryBlockedDocuments, syncMailbox, testPacerConnection } from "./sync.js";
+import { completePacerTwoFactor, readDocumentText, refreshDocumentFromSource, retryBlockedDocuments, syncMailbox, testPacerConnection } from "./sync.js";
 
 const app = express();
 const upload = multer({
@@ -420,6 +420,17 @@ app.post("/pacer-test", asyncRoute(async (_req, res) => {
   res.send(layout("PACER Connection Check", pacerTestResultHtml(result)));
 }));
 
+app.get("/pacer-setup", asyncRoute(async (_req, res) => {
+  await waitForDatabase();
+  res.send(layout("PACER Setup", pacerSetupHtml()));
+}));
+
+app.post("/pacer-setup", asyncRoute(async (req, res) => {
+  await waitForDatabase();
+  const result = await completePacerTwoFactor(req.body.otp_code);
+  res.send(layout("PACER Setup", pacerSetupHtml(result)));
+}));
+
 app.post("/cases/:id/documents", upload.single("document"), asyncRoute(async (req, res) => {
   await waitForDatabase();
   const caseId = Number(req.params.id);
@@ -590,6 +601,7 @@ function documentUnavailableHtml(doc, action) {
         <div class="button-row">
           <form method="post" action="/documents/${doc.id}/retry"><button type="submit">Retry This PDF</button></form>
           <form method="post" action="/pacer-test"><button class="secondary" type="submit">Check PACER Login</button></form>
+          <a class="button secondary-button" href="/pacer-setup">Enter PACER 2FA Code</a>
           <a class="button secondary" href="/">Back to dashboard</a>
         </div>
         <details class="technical-details">
@@ -604,6 +616,9 @@ function documentUnavailableHtml(doc, action) {
 function readableDocumentBlockReason(doc) {
   const status = String(doc.read_status || "");
   const summary = String(doc.document_summary || "");
+  if (/two-factor|2fa|verification code|authentication code|security code|mfa/i.test(`${status}\n${summary}`)) {
+    return "PACER is asking for a two-factor code before releasing the PDF.";
+  }
   if (/fee|charge|billing/i.test(`${status}\n${summary}`)) {
     return "PACER is asking for fee approval before releasing the PDF.";
   }
@@ -751,6 +766,7 @@ function layout(title, body) {
     .panel-head { padding: 14px 16px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; align-items: center; }
     .panel-body { padding: 10px 14px; }
     .notice { border-left: 4px solid var(--amber); background: #fff8eb; padding: 12px 14px; border-radius: 6px; margin-bottom: 16px; color: #713b12; }
+    .success-notice { border-left-color: var(--green); background: #f6fef9; color: #05603a; }
     .compact-notice { margin-bottom: 0; padding: 9px 12px; font-size: 13px; }
     .snapshot { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .6fr); gap: 14px; margin-bottom: 16px; }
     .command-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 12px; }
@@ -788,7 +804,12 @@ function layout(title, body) {
     th { background: #f8fafc; color: #475467; font-weight: 800; }
     tr:last-child td { border-bottom: 0; }
     a.button, button { background: var(--blue); color: white; border: 0; border-radius: 6px; padding: 9px 12px; text-decoration: none; font-weight: 800; cursor: pointer; font-size: 13px; }
+    a.secondary-button { display: inline-block; background: #ffffff; color: var(--blue); border: 1px solid #b8c7e6; }
     button.secondary { background: #ffffff; color: var(--blue); border: 1px solid #b8c7e6; }
+    input { width: 100%; max-width: 360px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; font: inherit; }
+    label { display: block; font-size: 13px; font-weight: 850; margin-bottom: 6px; }
+    .setup-form { display: grid; gap: 10px; align-items: start; margin: 14px 0; }
+    .setup-form button { width: fit-content; }
     .tag { display: inline-block; background: #e7f0ff; color: #1849a9; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 800; white-space: nowrap; }
     .tag.review { background:#fff1d6; color:#93370d; }
     .tag.high { background:#dcfae6; color:#05603a; }
@@ -984,6 +1005,29 @@ function pacerTestResultHtml(result) {
     <div class="panel-body">
       <p>${escapeHtml(result.summary || "PACER check finished.")}</p>
       <p class="muted">This checks the PACER login settings visible to the running app. It does not guarantee every court document will be released, because some ECF links require fee approval, court-specific prompts, or an unexpired free-look link.</p>
+      <p><a class="button secondary-button" href="/pacer-setup">Open PACER Setup</a></p>
+      <a class="button" href="/">Back to dashboard</a>
+    </div>
+  </section>`;
+}
+
+function pacerSetupHtml(result = null) {
+  const configured = Boolean(config.pacerUsername && config.pacerPassword);
+  return `<section class="panel" style="max-width:720px">
+    <div class="panel-head">
+      <div><h2>Connect PACER 2FA</h2><div class="muted">Use this when PACER asks for a one-time authentication code.</div></div>
+    </div>
+    <div class="panel-body">
+      ${result ? `<div class="notice ${result.ok ? "success-notice" : ""}">${escapeHtml(result.summary)}</div>` : ""}
+      ${configured
+        ? `<p>Enter the current PACER two-factor code. The app will sign in, save the PACER session for the web service and hourly sync, then retry blocked PDF downloads.</p>
+          <form method="post" action="/pacer-setup" class="setup-form">
+            <label for="otp_code">PACER 2FA code</label>
+            <input id="otp_code" name="otp_code" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" required>
+            <button type="submit">Save PACER Session & Retry PDFs</button>
+          </form>`
+        : `<div class="notice">PACER_USERNAME and PACER_PASSWORD are not configured in Render yet. Add the correct PACER account to both the web service and cron service, redeploy, then come back here.</div>`}
+      <p class="muted">If PACER asks for fees, the app will only accept those pages when <strong>PACER_AUTO_ACCEPT_FEES=true</strong> is set in Render and your firm approves those PACER charges.</p>
       <a class="button" href="/">Back to dashboard</a>
     </div>
   </section>`;
@@ -1126,7 +1170,10 @@ function systemStatusPanel({ pacerState, runs, stats }) {
       <div class="command-label">PACER</div>
       <div class="command-title">${escapeHtml(pacerState.title)}</div>
       <div class="command-text">${escapeHtml(pacerState.text)}</div>
-      <form method="post" action="/pacer-test" style="margin:4px 0 0"><button class="secondary" type="submit">Check PACER Login</button></form>
+      <div class="toolbar" style="margin:4px 0 0">
+        <form method="post" action="/pacer-test"><button class="secondary" type="submit">Check PACER Login</button></form>
+        <a class="button secondary-button" href="/pacer-setup">PACER Setup</a>
+      </div>
     </div>
     <div class="status-card ${readDocs ? "good" : "warn"}">
       <div class="command-label">Documents</div>
@@ -1257,6 +1304,7 @@ function blockedDocumentSection(documents) {
     <div class="section-note">${pacerStatusText()} The app retries these links every hour and when you press the button. If PACER asks for a fee, turn on PACER_AUTO_ACCEPT_FEES only if the firm approves PACER charges.</div>
     <form method="post" action="/documents/retry-blocked" class="inline-action-form">
       <button type="submit">Retry PACER Fetch</button>
+      <a class="button secondary-button" href="/pacer-setup">Enter PACER 2FA Code</a>
     </form>
     <div class="deadline-cards">
       ${documents.map((doc) => `<div class="deadline-card">

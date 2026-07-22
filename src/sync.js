@@ -1,4 +1,4 @@
-import { moveOldOpenItemsToHistory, pool } from "./db.js";
+import { getAppSetting, moveOldOpenItemsToHistory, pool, setAppSetting } from "./db.js";
 import { config } from "./config.js";
 import { analyzeDocument, extractNotice, looksLikeCourtNotice, parseDate } from "./extract.js";
 import { gmailForRefreshToken, listCourtNoticeMessages, listIncomingMessages, readMessage } from "./gmail.js";
@@ -124,7 +124,7 @@ export async function retryBlockedDocuments() {
   return { repaired, deadlineCount };
 }
 
-export async function testPacerConnection() {
+export async function testPacerConnection(otpCode = "") {
   if (config.pacerAuthCookie && !(config.pacerUsername && config.pacerPassword)) {
     return {
       ok: true,
@@ -138,12 +138,46 @@ export async function testPacerConnection() {
     };
   }
 
-  const jar = new CookieJar();
-  await loginToPacer(jar);
-  return {
-    ok: true,
-    summary: "PACER username/password login completed without an obvious login error."
-  };
+  try {
+    const jar = new CookieJar();
+    await loginToPacer(jar, { otpCode });
+    await savePacerSession(jar);
+    return {
+      ok: true,
+      summary: "PACER username/password login completed and the authenticated session was saved for document requests."
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      summary: error.message
+    };
+  }
+}
+
+export async function completePacerTwoFactor(otpCode) {
+  if (!config.pacerUsername || !config.pacerPassword) {
+    return { ok: false, summary: "PACER username/password are missing in Render." };
+  }
+  if (!String(otpCode || "").trim()) {
+    return { ok: false, summary: "Enter the current PACER two-factor code." };
+  }
+
+  try {
+    const jar = new CookieJar();
+    await loginToPacer(jar, { otpCode });
+    await savePacerSession(jar);
+    const retried = await retryBlockedDocuments();
+    const refreshedCount = Number(retried?.repaired || 0);
+    return {
+      ok: true,
+      summary: `PACER 2FA completed. The app saved the PACER session and retried blocked PDFs. ${refreshedCount} document(s) were refreshed.`
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      summary: error.message
+    };
+  }
 }
 
 async function processMessage(gmail, id, mailboxEmail, options = {}) {
@@ -886,23 +920,29 @@ function hasPacerCredentials() {
 }
 
 async function fetchDocumentUrlWithPacerAuth(url, fallbackFilename) {
-  if (!config.pacerAuthCookie && (!config.pacerUsername || !config.pacerPassword)) {
+  const storedCookie = await getPacerSessionCookie();
+  if (!storedCookie && !config.pacerAuthCookie && (!config.pacerUsername || !config.pacerPassword)) {
     return null;
   }
 
   const jar = new CookieJar();
-  if (config.pacerAuthCookie) {
-    jar.addRawCookie(config.pacerAuthCookie);
+  if (storedCookie || config.pacerAuthCookie) {
+    jar.addRawCookie(storedCookie || config.pacerAuthCookie);
   }
 
-  if (config.pacerUsername && config.pacerPassword) {
-    await loginToPacer(jar);
+  let downloaded = await fetchAuthenticatedDocument(url, fallbackFilename, jar, 0);
+  if (!pacerDownloadNeedsFreshLogin(downloaded.status) || !(config.pacerUsername && config.pacerPassword)) {
+    return downloaded;
   }
 
-  return await fetchAuthenticatedDocument(url, fallbackFilename, jar, 0);
+  const freshJar = new CookieJar();
+  await loginToPacer(freshJar);
+  await savePacerSession(freshJar);
+  downloaded = await fetchAuthenticatedDocument(url, fallbackFilename, freshJar, 0);
+  return downloaded;
 }
 
-async function loginToPacer(jar) {
+async function loginToPacer(jar, options = {}) {
   const loginPage = await fetchWithJar(config.pacerLoginUrl, {
     redirect: "follow",
     headers: {
@@ -931,9 +971,32 @@ async function loginToPacer(jar) {
     body: formValues.toString()
   }, jar);
   const loginHtml = await loginResponse.text();
-  const text = bufferToText(Buffer.from(loginHtml, "utf8"), "text/html").toLowerCase();
+  let text = bufferToText(Buffer.from(loginHtml, "utf8"), "text/html").toLowerCase();
   if (/(?:invalid|incorrect|failed|try again).{0,80}(?:login|password|username)|(?:login|password|username).{0,80}(?:invalid|incorrect|failed)/i.test(text)) {
     throw new Error("PACER login failed; check PACER_USERNAME and PACER_PASSWORD in Render");
+  }
+  if (pacerPageNeedsTwoFactor(loginHtml)) {
+    if (!options.otpCode) throw new Error("PACER is asking for a two-factor code. Open PACER Setup in the dashboard and enter the current code.");
+    const otpAction = htmlFormAction(loginHtml, loginResponse.url || action);
+    const otpValues = hiddenFormValues(loginHtml);
+    const otpField = otpFieldNameFor(loginHtml);
+    if (!otpField) throw new Error("PACER asked for two-factor authentication, but the app could not find the code field. Set PACER_OTP_FIELD in Render if this keeps happening.");
+    otpValues.set(otpField, String(options.otpCode).trim());
+    const otpResponse = await fetchWithJar(otpAction, {
+      method: "POST",
+      redirect: "follow",
+      headers: {
+        "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": loginResponse.url || action
+      },
+      body: otpValues.toString()
+    }, jar);
+    const otpHtml = await otpResponse.text();
+    text = bufferToText(Buffer.from(otpHtml, "utf8"), "text/html").toLowerCase();
+    if (pacerPageNeedsTwoFactor(otpHtml) || /(?:invalid|incorrect|expired).{0,80}(?:code|token|otp|verification)/i.test(text)) {
+      throw new Error("PACER two-factor code was not accepted. Enter a fresh current code and try again.");
+    }
   }
 }
 
@@ -1152,8 +1215,29 @@ function pacerCredentialStatus(fallback) {
   return `download_error: ${fallback}`;
 }
 
+async function getPacerSessionCookie() {
+  return await getAppSetting("pacer_auth_cookie");
+}
+
+async function savePacerSession(jar) {
+  const cookieHeader = jar.header();
+  if (cookieHeader) await setAppSetting("pacer_auth_cookie", cookieHeader);
+}
+
+function pacerDownloadNeedsFreshLogin(status) {
+  return /login|authenticate|password|username|two-factor|2fa|verification code/i.test(String(status || ""));
+}
+
+function pacerPageNeedsTwoFactor(html) {
+  const text = bufferToText(Buffer.from(String(html || ""), "utf8"), "text/html").toLowerCase();
+  return /two[-\s]?factor|2fa|one[-\s]?time|verification code|authentication code|security code|multi[-\s]?factor|mfa/.test(text);
+}
+
 function pacerHtmlBlockReason(html) {
   const text = bufferToText(Buffer.from(String(html || ""), "utf8"), "text/html").toLowerCase();
+  if (/two[-\s]?factor|2fa|one[-\s]?time|verification code|authentication code|security code|multi[-\s]?factor|mfa/.test(text)) {
+    return "download_error: PACER requires two-factor authentication; open PACER Setup in the dashboard and enter the current code";
+  }
   if (/(?:fee|charge|cost|billing|client code|receipt|transaction)/i.test(text) && !config.pacerAutoAcceptFees) {
     return "download_error: PACER requires fee acceptance; set PACER_AUTO_ACCEPT_FEES=true in Render to let the app retrieve billable PDFs";
   }
@@ -1175,6 +1259,25 @@ function fieldNameFor(html, configuredName, candidates, fallback) {
     }
   }
   return fallback;
+}
+
+function otpFieldNameFor(html) {
+  if (config.pacerOtpField) return config.pacerOtpField;
+  const inputs = [...String(html || "").matchAll(/<input\b[^>]*>/gi)].map((match) => match[0]);
+  for (const input of inputs) {
+    const name = input.match(/\bname=["']?([^"'\s>]+)/i)?.[1];
+    if (!name) continue;
+    const type = input.match(/\btype=["']?([^"'\s>]+)/i)?.[1] || "text";
+    if (/hidden|submit|button|checkbox|radio/i.test(type)) continue;
+    const id = input.match(/\bid=["']?([^"'\s>]+)/i)?.[1] || "";
+    const label = input.match(/\b(?:aria-label|placeholder)=["']?([^"'>]+)/i)?.[1] || "";
+    const haystack = `${name} ${id} ${label}`.toLowerCase().replace(/[_:\-.]/g, "");
+    if (/clientcode/.test(haystack)) continue;
+    if (/(otp|mfa|token|verification|authentication|security|onetime|passcode|authcode)/.test(haystack)) {
+      return decodeHtmlAttribute(name);
+    }
+  }
+  return null;
 }
 
 function decodeHtmlAttribute(value) {

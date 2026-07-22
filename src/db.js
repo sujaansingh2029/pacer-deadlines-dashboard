@@ -126,6 +126,11 @@ async function ensureCoreSchema() {
         summary text,
         error text
       )`,
+      `create table if not exists app_settings (
+        key text primary key,
+        value text not null,
+        updated_at timestamptz not null default now()
+      )`,
       "alter table docket_events add column if not exists status text not null default 'open'",
       "alter table docket_events add column if not exists archived_at timestamptz",
       "alter table deadlines add column if not exists archived_at timestamptz",
@@ -223,6 +228,30 @@ export async function upsertMailbox(email, refreshToken) {
 export async function getPrimaryMailbox() {
   const result = await pool.query("select * from mailboxes order by created_at asc limit 1");
   return result.rows[0] || null;
+}
+
+export async function getAppSetting(key) {
+  await ensureAppSettingsTable();
+  const result = await pool.query("select value from app_settings where key = $1", [key]);
+  return result.rows[0]?.value || null;
+}
+
+export async function setAppSetting(key, value) {
+  await ensureAppSettingsTable();
+  await pool.query(
+    `insert into app_settings (key, value, updated_at)
+     values ($1, $2, now())
+     on conflict (key) do update set value = excluded.value, updated_at = now()`,
+    [key, value]
+  );
+}
+
+async function ensureAppSettingsTable() {
+  await pool.query(`create table if not exists app_settings (
+    key text primary key,
+    value text not null,
+    updated_at timestamptz not null default now()
+  )`);
 }
 
 export async function moveOldOpenItemsToHistory() {
