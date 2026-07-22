@@ -14,6 +14,13 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 30 * 1024 * 1024 }
 });
+let dbReady = Promise.resolve();
+let dbStartupError = null;
+
+async function waitForDatabase() {
+  await dbReady;
+}
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cookieParser(config.sessionSecret));
@@ -46,6 +53,8 @@ app.use((req, res, next) => {
 app.get("/", async (req, res) => {
   const missing = assertRequiredConfig();
   if (missing.length) return res.send(layout("Setup Required", setupHtml(missing)));
+  if (dbStartupError) return res.status(500).send(layout("Database Error", databaseErrorHtml(dbStartupError)));
+  await waitForDatabase();
 
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.send(layout("Connect Gmail", connectHtml()));
@@ -322,6 +331,7 @@ app.get("/auth/google", (_req, res) => {
 });
 
 app.get("/oauth2callback", async (req, res) => {
+  await waitForDatabase();
   const { code } = req.query;
   if (!code) return res.status(400).send("Missing OAuth code.");
   const { email, tokens } = await exchangeCode(code);
@@ -335,6 +345,7 @@ app.get("/oauth2callback", async (req, res) => {
 app.post("/api/sync", async (req, res) => {
   const provided = req.get("x-cron-secret") || req.query.secret || req.body.secret;
   if (provided !== config.cronSecret) return res.status(401).json({ error: "Unauthorized" });
+  await waitForDatabase();
   const mailbox = await getPrimaryMailbox();
   if (!mailbox) return res.json({ ok: true, summary: "No Gmail mailbox is connected yet." });
   const result = await syncMailbox(mailbox);
@@ -342,37 +353,44 @@ app.post("/api/sync", async (req, res) => {
 });
 
 app.post("/sync-now", async (_req, res) => {
+  await waitForDatabase();
   const mailbox = await getPrimaryMailbox();
   if (mailbox) await syncMailbox(mailbox);
   res.redirect("/");
 });
 
 app.post("/deadlines/:id/archive", async (req, res) => {
+  await waitForDatabase();
   await pool.query("update deadlines set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
 });
 
 app.post("/events/:id/archive", async (req, res) => {
+  await waitForDatabase();
   await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
 });
 
 app.post("/emails/:id/archive", async (req, res) => {
+  await waitForDatabase();
   await pool.query("update emails set review_status = 'archived', archived_at = now() where gmail_id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
 });
 
 app.post("/documents/:id/archive", async (req, res) => {
+  await waitForDatabase();
   await pool.query("update documents set review_status = 'archived', archived_at = now(), updated_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
 });
 
 app.post("/documents/retry-blocked", async (req, res) => {
+  await waitForDatabase();
   await retryBlockedDocuments();
   res.redirect(req.get("referer") || "/");
 });
 
 app.post("/cases/:id/documents", upload.single("document"), async (req, res) => {
+  await waitForDatabase();
   const caseId = Number(req.params.id);
   const caseResult = await pool.query("select id, case_name, court, case_number, judge from cases where id = $1", [caseId]);
   if (!caseResult.rowCount) return res.status(404).send("Case not found.");
@@ -460,6 +478,7 @@ async function saveDeadlinesFromUploadedDocument(caseRow, filename, text) {
 }
 
 app.get("/documents/:id/download", async (req, res) => {
+  await waitForDatabase();
   const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
   if (!isServableDocument(doc)) return res.status(409).send(documentUnavailableHtml(doc, "download"));
@@ -470,6 +489,7 @@ app.get("/documents/:id/download", async (req, res) => {
 });
 
 app.get("/documents/:id/view", async (req, res) => {
+  await waitForDatabase();
   const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
   if (!isServableDocument(doc)) return res.status(409).send(documentUnavailableHtml(doc, "view"));
@@ -528,6 +548,7 @@ function documentUnavailableHtml(doc, action) {
 }
 
 app.post("/api/chat", async (req, res) => {
+  await waitForDatabase();
   const question = String(req.body?.question || "").trim();
   if (!question) return res.status(400).json({ error: "Ask a question first." });
   if (!config.openaiApiKey) return res.status(400).json({ error: "OPENAI_API_KEY is not configured." });
@@ -562,10 +583,20 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-if (config.databaseUrl) await initDb();
 app.listen(config.port, () => {
   console.log(`PACER dashboard listening on ${config.port}`);
 });
+
+if (config.databaseUrl) {
+  dbReady = initDb()
+    .then(() => {
+      console.log("PACER dashboard database ready");
+    })
+    .catch((error) => {
+      dbStartupError = error;
+      console.error("PACER dashboard database startup failed:", error);
+    });
+}
 
 function layout(title, body) {
   return `<!doctype html>
@@ -734,6 +765,17 @@ function layout(title, body) {
 
 function setupHtml(missing) {
   return `<div class="notice">Missing required environment variables: ${missing.map(escapeHtml).join(", ")}.</div>`;
+}
+
+function databaseErrorHtml(error) {
+  return `<div class="panel">
+    <div class="panel-head"><h2>Database is not ready</h2></div>
+    <div class="panel-body">
+      <p>The dashboard opened its web port, but it could not connect to the Render database yet.</p>
+      <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
+      <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>, then redeploy.</p>
+    </div>
+  </div>`;
 }
 
 function connectHtml() {
