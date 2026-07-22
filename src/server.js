@@ -16,6 +16,7 @@ const upload = multer({
 });
 let dbReady = Promise.resolve();
 let dbStartupError = null;
+let dbStatus = config.databaseUrl ? "starting" : "missing";
 
 async function waitForDatabase() {
   await dbReady;
@@ -24,6 +25,10 @@ async function waitForDatabase() {
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cookieParser(config.sessionSecret));
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).send("ok");
+});
 
 app.get("/login", (req, res) => {
   res.send(layout("Dashboard Login", loginHtml(req.query.error)));
@@ -54,6 +59,7 @@ app.get("/", async (req, res) => {
   const missing = assertRequiredConfig();
   if (missing.length) return res.send(layout("Setup Required", setupHtml(missing)));
   if (dbStartupError) return res.status(500).send(layout("Database Error", databaseErrorHtml(dbStartupError)));
+  if (dbStatus !== "ready") return res.status(503).send(layout("Starting Up", databaseStartingHtml()));
   await waitForDatabase();
 
   const mailbox = await getPrimaryMailbox();
@@ -588,14 +594,23 @@ app.listen(config.port, () => {
 });
 
 if (config.databaseUrl) {
-  dbReady = initDb()
+  dbReady = withTimeout(initDb(), 25000, "Database startup timed out after 25 seconds")
     .then(() => {
+      dbStatus = "ready";
       console.log("PACER dashboard database ready");
     })
     .catch((error) => {
+      dbStatus = "error";
       dbStartupError = error;
       console.error("PACER dashboard database startup failed:", error);
     });
+}
+
+function withTimeout(promise, ms, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
 }
 
 function layout(title, body) {
@@ -774,6 +789,16 @@ function databaseErrorHtml(error) {
       <p>The dashboard opened its web port, but it could not connect to the Render database yet.</p>
       <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
       <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>, then redeploy.</p>
+    </div>
+  </div>`;
+}
+
+function databaseStartingHtml() {
+  return `<div class="panel">
+    <div class="panel-head"><h2>Dashboard is starting</h2></div>
+    <div class="panel-body">
+      <p>The web service is online. It is connecting to the Render database now.</p>
+      <p class="muted">Refresh this page in about 30 seconds. If it stays here, check the Render logs for a database connection error.</p>
     </div>
   </div>`;
 }
