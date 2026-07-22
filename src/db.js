@@ -8,8 +8,8 @@ export const pool = new Pool({
   ssl: config.databaseUrl?.includes("localhost") ? false : { rejectUnauthorized: false },
   connectionTimeoutMillis: 20000,
   idleTimeoutMillis: 30000,
-  query_timeout: 120000,
-  statement_timeout: 120000
+  query_timeout: 45000,
+  statement_timeout: 45000
 });
 
 export async function initDb() {
@@ -21,122 +21,125 @@ export async function initDb() {
 }
 
 async function ensureCoreSchema() {
-  await pool.query(`
-    create table if not exists mailboxes (
-      id serial primary key,
-      email text unique not null,
-      refresh_token text not null,
-      last_history_id text,
-      last_sync_at timestamptz,
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now()
-    );
+  const client = await pool.connect();
+  try {
+    await client.query("set statement_timeout = '45s'");
+    await client.query("set lock_timeout = '10s'");
 
-    create table if not exists emails (
-      gmail_id text primary key,
-      thread_id text,
-      mailbox_email text not null,
-      from_header text,
-      to_header text,
-      subject text,
-      snippet text,
-      received_at timestamptz,
-      body_text text,
-      is_court_notice boolean not null default false,
-      processed_at timestamptz not null default now()
-    );
+    const statements = [
+      `create table if not exists mailboxes (
+        id serial primary key,
+        email text unique not null,
+        refresh_token text not null,
+        last_history_id text,
+        last_sync_at timestamptz,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now()
+      )`,
+      `create table if not exists emails (
+        gmail_id text primary key,
+        thread_id text,
+        mailbox_email text not null,
+        from_header text,
+        to_header text,
+        subject text,
+        snippet text,
+        received_at timestamptz,
+        body_text text,
+        is_court_notice boolean not null default false,
+        processed_at timestamptz not null default now()
+      )`,
+      `create table if not exists cases (
+        id serial primary key,
+        case_key text unique not null,
+        case_name text,
+        court text,
+        case_number text,
+        judge text,
+        updated_at timestamptz not null default now()
+      )`,
+      `create table if not exists docket_events (
+        id serial primary key,
+        case_id integer references cases(id) on delete cascade,
+        gmail_id text references emails(gmail_id) on delete cascade,
+        event_title text,
+        docket_number text,
+        filing_party text,
+        filed_at timestamptz,
+        source_received_at timestamptz,
+        summary text,
+        status text not null default 'open',
+        archived_at timestamptz,
+        raw jsonb not null default '{}'::jsonb,
+        created_at timestamptz not null default now()
+      )`,
+      `create table if not exists deadlines (
+        id serial primary key,
+        case_id integer references cases(id) on delete cascade,
+        gmail_id text references emails(gmail_id) on delete cascade,
+        label text not null,
+        due_at timestamptz,
+        date_text text,
+        confidence text not null default 'needs_review',
+        source_quote text,
+        status text not null default 'open',
+        archived_at timestamptz,
+        created_at timestamptz not null default now()
+      )`,
+      `create table if not exists documents (
+        id serial primary key,
+        case_id integer references cases(id) on delete cascade,
+        gmail_id text references emails(gmail_id) on delete cascade,
+        filename text not null,
+        mime_type text,
+        size_bytes integer,
+        source_attachment_id text,
+        source_url text,
+        source_type text not null default 'attachment',
+        content bytea,
+        extracted_text text,
+        document_type text,
+        document_summary text,
+        read_status text not null default 'pending',
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        unique (gmail_id, filename, size_bytes)
+      )`,
+      `create table if not exists sync_runs (
+        id serial primary key,
+        started_at timestamptz not null default now(),
+        finished_at timestamptz,
+        mailbox_email text,
+        scanned_count integer not null default 0,
+        notice_count integer not null default 0,
+        deadline_count integer not null default 0,
+        document_count integer not null default 0,
+        summary text,
+        error text
+      )`,
+      "alter table docket_events add column if not exists status text not null default 'open'",
+      "alter table docket_events add column if not exists archived_at timestamptz",
+      "alter table deadlines add column if not exists archived_at timestamptz",
+      "alter table emails add column if not exists review_status text not null default 'open'",
+      "alter table emails add column if not exists archived_at timestamptz",
+      "alter table documents add column if not exists extracted_text text",
+      "alter table documents add column if not exists document_type text",
+      "alter table documents add column if not exists document_summary text",
+      "alter table documents add column if not exists read_status text not null default 'pending'",
+      "alter table documents add column if not exists source_url text",
+      "alter table documents add column if not exists source_type text not null default 'attachment'",
+      "alter table documents add column if not exists updated_at timestamptz not null default now()",
+      "alter table documents add column if not exists review_status text not null default 'open'",
+      "alter table documents add column if not exists archived_at timestamptz",
+      "alter table sync_runs add column if not exists document_count integer not null default 0"
+    ];
 
-    create table if not exists cases (
-      id serial primary key,
-      case_key text unique not null,
-      case_name text,
-      court text,
-      case_number text,
-      judge text,
-      updated_at timestamptz not null default now()
-    );
-
-    create table if not exists docket_events (
-      id serial primary key,
-      case_id integer references cases(id) on delete cascade,
-      gmail_id text references emails(gmail_id) on delete cascade,
-      event_title text,
-      docket_number text,
-      filing_party text,
-      filed_at timestamptz,
-      source_received_at timestamptz,
-      summary text,
-      status text not null default 'open',
-      archived_at timestamptz,
-      raw jsonb not null default '{}'::jsonb,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists deadlines (
-      id serial primary key,
-      case_id integer references cases(id) on delete cascade,
-      gmail_id text references emails(gmail_id) on delete cascade,
-      label text not null,
-      due_at timestamptz,
-      date_text text,
-      confidence text not null default 'needs_review',
-      source_quote text,
-      status text not null default 'open',
-      archived_at timestamptz,
-      created_at timestamptz not null default now()
-    );
-
-    create table if not exists documents (
-      id serial primary key,
-      case_id integer references cases(id) on delete cascade,
-      gmail_id text references emails(gmail_id) on delete cascade,
-      filename text not null,
-      mime_type text,
-      size_bytes integer,
-      source_attachment_id text,
-      source_url text,
-      source_type text not null default 'attachment',
-      content bytea,
-      extracted_text text,
-      document_type text,
-      document_summary text,
-      read_status text not null default 'pending',
-      created_at timestamptz not null default now(),
-      updated_at timestamptz not null default now(),
-      unique (gmail_id, filename, size_bytes)
-    );
-
-    create table if not exists sync_runs (
-      id serial primary key,
-      started_at timestamptz not null default now(),
-      finished_at timestamptz,
-      mailbox_email text,
-      scanned_count integer not null default 0,
-      notice_count integer not null default 0,
-      deadline_count integer not null default 0,
-      document_count integer not null default 0,
-      summary text,
-      error text
-    );
-  `);
-
-  await pool.query(`
-    alter table docket_events add column if not exists status text not null default 'open';
-    alter table docket_events add column if not exists archived_at timestamptz;
-    alter table deadlines add column if not exists archived_at timestamptz;
-    alter table emails add column if not exists review_status text not null default 'open';
-    alter table emails add column if not exists archived_at timestamptz;
-    alter table documents add column if not exists extracted_text text;
-    alter table documents add column if not exists document_type text;
-    alter table documents add column if not exists document_summary text;
-    alter table documents add column if not exists read_status text not null default 'pending';
-    alter table documents add column if not exists source_url text;
-    alter table documents add column if not exists source_type text not null default 'attachment';
-    alter table documents add column if not exists updated_at timestamptz not null default now();
-    alter table documents add column if not exists review_status text not null default 'open';
-    alter table documents add column if not exists archived_at timestamptz;
-    alter table sync_runs add column if not exists document_count integer not null default 0;
-  `);
+    for (const statement of statements) {
+      await client.query(statement);
+    }
+  } finally {
+    client.release();
+  }
 }
 
 async function ensureIndexes() {

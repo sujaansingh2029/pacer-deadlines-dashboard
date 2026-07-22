@@ -18,6 +18,10 @@ let dbReady = Promise.resolve();
 let dbStartupError = null;
 let dbStatus = config.databaseUrl ? "starting" : "missing";
 const dbStartedAt = new Date();
+let dbStartupAttempts = 0;
+let dbLastErrorAt = null;
+let dbNextRetryAt = null;
+let dbRetryTimer = null;
 
 async function waitForDatabase() {
   await dbReady;
@@ -595,15 +599,34 @@ app.listen(config.port, () => {
 });
 
 if (config.databaseUrl) {
+  startDatabaseStartup();
+}
+
+function startDatabaseStartup() {
+  if (dbRetryTimer) {
+    clearTimeout(dbRetryTimer);
+    dbRetryTimer = null;
+  }
+
+  dbStartupAttempts += 1;
+  dbStatus = "starting";
+  dbStartupError = null;
+  dbNextRetryAt = null;
+
   dbReady = initDb()
     .then(() => {
       dbStatus = "ready";
+      dbLastErrorAt = null;
+      dbNextRetryAt = null;
       console.log("PACER dashboard database ready");
     })
     .catch((error) => {
       dbStatus = "error";
       dbStartupError = error;
+      dbLastErrorAt = new Date();
+      dbNextRetryAt = new Date(Date.now() + 30000);
       console.error("PACER dashboard database startup failed:", error);
+      dbRetryTimer = setTimeout(startDatabaseStartup, 30000);
     });
 }
 
@@ -777,12 +800,16 @@ function setupHtml(missing) {
 }
 
 function databaseErrorHtml(error) {
+  const lastError = dbLastErrorAt ? formatDate(dbLastErrorAt) : "just now";
+  const retryText = dbNextRetryAt ? `Next automatic retry: ${formatDate(dbNextRetryAt)}.` : "The dashboard will retry automatically.";
   return `<div class="panel">
     <div class="panel-head"><h2>Database is not ready</h2></div>
     <div class="panel-body">
       <p>The dashboard opened its web port, but it could not connect to the Render database yet.</p>
       <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
+      <p class="muted">Attempt ${dbStartupAttempts}. Last failed: ${escapeHtml(lastError)}. ${escapeHtml(retryText)}</p>
       <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>. In Render, this should come from the database connection string, not a manually typed placeholder.</p>
+      <p>If this says <strong>Query read timeout</strong>, Render reached Postgres but Postgres did not answer in time. Restart the Render database, then restart the web service. If it still happens, create a fresh Render database and reconnect <strong>DATABASE_URL</strong>.</p>
       <p class="muted">If Render is deploying from GitHub, make sure the GitHub repo contains this Node app at the repo root: package.json, render.yaml, and the src folder.</p>
     </div>
   </div>`;
@@ -790,11 +817,12 @@ function databaseErrorHtml(error) {
 
 function databaseStartingHtml() {
   const seconds = Math.max(0, Math.round((Date.now() - dbStartedAt.getTime()) / 1000));
+  const retryText = dbNextRetryAt ? ` Next retry: ${formatDate(dbNextRetryAt)}.` : "";
   return `<div class="panel">
     <div class="panel-head"><h2>Dashboard is starting</h2></div>
     <div class="panel-body">
       <p>The web service is online. It is connecting to the Render database now.</p>
-      <p class="muted">Database status: ${escapeHtml(dbStatus)}. Waiting for ${seconds} second(s).</p>
+      <p class="muted">Database status: ${escapeHtml(dbStatus)}. Attempt ${dbStartupAttempts}. Waiting for ${seconds} second(s).${escapeHtml(retryText)}</p>
       <p class="muted">Refresh this page in about 30 seconds. If it stays here for more than 2 minutes, check the Render web service environment and confirm DATABASE_URL points to pacer-deadlines-db.</p>
       <p class="muted">If Render is connected to GitHub, it will deploy whatever is in GitHub, not the zip. If you uploaded the zip manually, GitHub files do not matter for this deploy.</p>
     </div>
