@@ -13,6 +13,14 @@ export const pool = new Pool({
 });
 
 export async function initDb() {
+  await ensureCoreSchema();
+
+  ensureIndexes().catch((error) => {
+    console.warn("PACER dashboard background index setup failed:", error.message);
+  });
+}
+
+async function ensureCoreSchema() {
   await pool.query(`
     create table if not exists mailboxes (
       id serial primary key,
@@ -128,11 +136,20 @@ export async function initDb() {
     alter table documents add column if not exists review_status text not null default 'open';
     alter table documents add column if not exists archived_at timestamptz;
     alter table sync_runs add column if not exists document_count integer not null default 0;
-    create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at);
-    create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc);
-    create index if not exists documents_case_id_idx on documents (case_id, created_at desc);
-    create unique index if not exists documents_source_url_idx on documents (source_url) where source_url is not null;
   `);
+}
+
+async function ensureIndexes() {
+  const statements = [
+    "create index if not exists deadlines_status_due_at_idx on deadlines (status, due_at)",
+    "create index if not exists docket_events_status_received_idx on docket_events (status, source_received_at desc)",
+    "create index if not exists documents_case_id_idx on documents (case_id, created_at desc)",
+    "create unique index if not exists documents_source_url_idx on documents (source_url) where source_url is not null"
+  ];
+
+  for (const statement of statements) {
+    await pool.query(statement);
+  }
 }
 
 export async function upsertMailbox(email, refreshToken) {
