@@ -55,7 +55,7 @@ export async function syncMailbox(mailbox) {
     const documentStats = await pool.query(`
       select
         count(*) as total_documents,
-        count(*) filter (where read_status = 'read' or length(coalesce(extracted_text, '')) >= 40) as analyzed_documents,
+        count(*) filter (where read_status = 'read') as analyzed_documents,
         count(*) filter (where read_status like 'download_error:%' or read_status = 'notice_read_pdf_blocked') as pending_documents
       from documents
     `);
@@ -67,7 +67,7 @@ export async function syncMailbox(mailbox) {
     const pendingNote = Number(docStats.pending_documents || 0)
       ? ` ${Number(docStats.pending_documents)} PACER PDF(s) are still blocked by the court/PACER response.`
       : "";
-    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), updated ${documentCount} document(s). ${Number(docStats.analyzed_documents || 0)} of ${Number(docStats.total_documents || 0)} document record(s) have readable text or notice detail.${documentDeadlineNote}${pendingNote}${historyNote}`;
+    const summary = `Reviewed ${scanned} message(s), found ${notices} court notice(s), extracted ${deadlineCount} deadline(s), updated ${documentCount} document(s). ${Number(docStats.analyzed_documents || 0)} of ${Number(docStats.total_documents || 0)} saved document(s) were fully readable.${documentDeadlineNote}${pendingNote}${historyNote}`;
     await pool.query(
       "update sync_runs set finished_at = now(), scanned_count = $1, notice_count = $2, deadline_count = $3, document_count = $4, summary = $5 where id = $6",
       [scanned, notices, deadlineCount, documentCount, summary, runId]
@@ -447,7 +447,7 @@ export async function refreshDocumentFromSource(documentId) {
       downloaded.mimeType,
       downloaded.size,
       downloaded.content,
-      extracted.text || fallbackSummary,
+      status === "read" ? extracted.text : fallbackSummary,
       status,
       analysis.documentType,
       analysis.summary,
@@ -608,7 +608,7 @@ async function saveDocuments(caseId, email) {
         downloaded.size,
         linkedDocument.url,
         downloaded.content,
-        extracted.text || fallbackSummary,
+        status === "read" ? extracted.text : fallbackSummary,
         status,
         analysis.documentType,
         analysis.summary
@@ -696,6 +696,11 @@ async function downloadLinkedDocument(linkedDocument) {
 }
 
 async function fetchDocumentUrl(url, fallbackFilename, depth, options = {}) {
+  if (!options.authenticated && depth === 0 && hasPacerCredentials()) {
+    const authenticated = await fetchDocumentUrlWithPacerAuth(url, fallbackFilename);
+    if (authenticated) return authenticated;
+  }
+
   const response = await fetch(url, {
     redirect: "follow",
     headers: {
@@ -747,6 +752,10 @@ async function fetchDocumentUrl(url, fallbackFilename, depth, options = {}) {
     content,
     status: "downloaded"
   };
+}
+
+function hasPacerCredentials() {
+  return Boolean(config.pacerAuthCookie || (config.pacerUsername && config.pacerPassword));
 }
 
 async function fetchDocumentUrlWithPacerAuth(url, fallbackFilename) {
@@ -1095,13 +1104,21 @@ export async function readDocumentText(attachment) {
   const content = attachment.content || Buffer.alloc(0);
 
   try {
+    const typeHint = sniffMimeType(content, mimeType);
+    if (typeHint.includes("html")) {
+      const text = bufferToText(content, "text/html");
+      const blocker = htmlDocumentBlockerStatus(text);
+      if (blocker) return { status: blocker, text: null };
+      return { status: "read", text: truncateText(text) };
+    }
+
     if (content.subarray(0, 5).toString("utf8") === "%PDF-") {
       const pdfParse = (await import("pdf-parse")).default;
       const parsed = await pdfParse(content);
       return readablePdfText(parsed.text);
     }
 
-    if (mimeType.startsWith("text/") || mimeType.includes("html") || /\.(txt|csv|html?|xml)$/i.test(filename)) {
+    if (mimeType.startsWith("text/") || /\.(txt|csv|xml)$/i.test(filename)) {
       return { status: "read", text: truncateText(bufferToText(content, mimeType)) };
     }
 
@@ -1126,6 +1143,21 @@ function readablePdfText(text) {
     };
   }
   return { status: "read", text: cleaned };
+}
+
+function htmlDocumentBlockerStatus(text) {
+  const lower = String(text || "").toLowerCase();
+  if (!lower) return null;
+  if (/note to public access users|one free electronic copy|pacer access fees|30-page limit/.test(lower)) {
+    return "notice_read_pdf_blocked";
+  }
+  if (/(?:login|sign in|password|username).{0,120}(?:pacer|court|ecf)|(?:pacer|court|ecf).{0,120}(?:login|sign in|password|username)/i.test(lower)) {
+    return pacerCredentialStatus("PACER returned a login page instead of the PDF");
+  }
+  if (/(?:fee|charge|cost|billing|client code|receipt|transaction)/i.test(lower) && !config.pacerAutoAcceptFees) {
+    return "download_error: PACER requires fee acceptance; set PACER_AUTO_ACCEPT_FEES=true in Render to let the app retrieve billable PDFs";
+  }
+  return null;
 }
 
 function bufferToText(buffer, mimeType) {

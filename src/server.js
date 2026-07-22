@@ -43,7 +43,7 @@ app.use((req, res, next) => {
   return res.redirect("/login");
 });
 
-app.get("/", async (_req, res) => {
+app.get("/", async (req, res) => {
   const missing = assertRequiredConfig();
   if (missing.length) return res.send(layout("Setup Required", setupHtml(missing)));
 
@@ -109,7 +109,7 @@ app.get("/", async (_req, res) => {
       left join emails e on e.gmail_id = de.gmail_id or e.gmail_id = d.gmail_id or e.gmail_id = doc.gmail_id
       group by c.id
       order by next_deadline_at nulls last, latest_activity_at desc nulls last
-      limit 30
+      limit 100
     `),
     pool.query(`
       select doc.id, doc.case_id, doc.filename, doc.mime_type, doc.size_bytes, doc.read_status,
@@ -118,7 +118,7 @@ app.get("/", async (_req, res) => {
       from documents doc
       left join emails e on e.gmail_id = doc.gmail_id
       order by doc.created_at desc
-      limit 200
+      limit 1000
     `),
     pool.query(`
       select e.gmail_id, e.from_header, e.subject, e.received_at, e.is_court_notice,
@@ -201,7 +201,7 @@ app.get("/", async (_req, res) => {
         (select count(*) from deadlines where status = 'open' and due_at is null) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
         (select count(*) from documents) as documents,
-        (select count(*) from documents where read_status = 'read' or length(coalesce(extracted_text, '')) >= 40) as read_documents,
+        (select count(*) from documents where read_status = 'read') as read_documents,
         (select count(*) from documents where read_status <> 'read') as unread_documents,
         ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open') + (select count(*) from emails where coalesce(review_status, 'open') <> 'open') + (select count(*) from documents where coalesce(review_status, 'open') <> 'open')) as history_items
     `)
@@ -222,7 +222,8 @@ app.get("/", async (_req, res) => {
     blockedDocuments: blockedDocuments.rows,
     historyItems: historyItems.rows,
     runs: runs.rows,
-    stats: stats.rows[0]
+    stats: stats.rows[0],
+    calendarMonth: String(req.query.month || "")
   })));
 });
 
@@ -625,6 +626,7 @@ function layout(title, body) {
     .inline-action-form button { padding: 8px 11px; }
     table { width: 100%; border-collapse: collapse; table-layout: fixed; }
     th, td { padding: 11px 10px; text-align: left; border-bottom: 1px solid #edf0f5; vertical-align: top; font-size: 13px; }
+    td { overflow-wrap: anywhere; word-break: break-word; }
     th { background: #f8fafc; color: #475467; font-weight: 800; }
     tr:last-child td { border-bottom: 0; }
     a.button, button { background: var(--blue); color: white; border: 0; border-radius: 6px; padding: 9px 12px; text-decoration: none; font-weight: 800; cursor: pointer; font-size: 13px; }
@@ -633,7 +635,7 @@ function layout(title, body) {
     .tag.review { background:#fff1d6; color:#93370d; }
     .tag.high { background:#dcfae6; color:#05603a; }
     .case-title { font-weight: 800; font-size: 15px; line-height: 1.3; }
-    .due { font-weight: 800; white-space: nowrap; }
+    .due { font-weight: 800; overflow-wrap: anywhere; }
     .empty { padding: 18px; color: var(--muted); }
     .check-form { margin: 0; }
     .check-button { width: 26px; height: 26px; border-radius: 6px; background: #fff; border: 1px solid #98a2b3; color: transparent; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
@@ -651,7 +653,7 @@ function layout(title, body) {
     .document-row { border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #fbfcfe; }
     .document-row-main { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: start; }
     .document-name { font-weight: 800; overflow-wrap: anywhere; }
-    .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; }
+    .document-preview { color: var(--muted); font-size: 12px; margin-top: 4px; line-height: 1.35; overflow-wrap: anywhere; }
     .document-summary { font-size: 13px; margin-top: 5px; line-height: 1.35; }
     .document-link { color: var(--blue); font-size: 12px; font-weight: 800; text-decoration: none; white-space: nowrap; }
     .document-actions { display: flex; gap: 10px; align-items: center; }
@@ -664,7 +666,9 @@ function layout(title, body) {
     .upload-form input { max-width: 280px; font-size: 12px; color: var(--muted); }
     .upload-form button { padding: 7px 10px; font-size: 12px; }
     .case-deadlines { margin-top: 12px; border-top: 1px solid #edf0f5; padding-top: 10px; display: grid; gap: 8px; }
-    .case-deadline-row { display: grid; grid-template-columns: 34px 170px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
+    .case-deadline-row { display: grid; grid-template-columns: 34px minmax(0,1fr); gap: 10px; align-items: start; border: 1px solid #edf0f5; border-radius: 8px; padding: 9px; background: #ffffff; }
+    .case-deadline-top { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 5px; }
+    .case-deadline-title { font-weight: 900; line-height: 1.3; overflow-wrap: anywhere; }
     .deadline-cards { display: grid; gap: 8px; padding: 10px; }
     .deadline-card { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; align-items: start; border: 1px solid #e4e7ec; border-radius: 8px; padding: 11px; background: #ffffff; }
     .deadline-when { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; min-width: 0; margin-bottom: 4px; }
@@ -674,6 +678,10 @@ function layout(title, body) {
     .deadline-source { color: var(--muted); font-size: 13px; line-height: 1.38; overflow-wrap: anywhere; max-height: 4.2em; overflow: hidden; }
     .deadline-meta { color: var(--muted); font-size: 12px; line-height: 1.35; }
     .calendar-panel { margin-bottom: 10px; border-bottom: 1px solid #edf0f5; }
+    .calendar-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .calendar-month-title { font-size: 16px; font-weight: 900; }
+    .calendar-nav { display: flex; gap: 8px; align-items: center; }
+    .calendar-nav a { color: var(--blue); text-decoration: none; font-weight: 900; border: 1px solid #cbd5e1; border-radius: 6px; padding: 6px 9px; background: #fff; }
     .calendar-days { display: grid; gap: 10px; padding: 12px; }
     .calendar-day { border: 1px solid #e4e7ec; border-radius: 8px; background: #ffffff; overflow: hidden; }
     .calendar-day-head { display: flex; justify-content: space-between; gap: 10px; align-items: center; padding: 10px 12px; background: #f8fafc; border-bottom: 1px solid #edf0f5; }
@@ -693,6 +701,8 @@ function layout(title, body) {
     .calendar-button:hover, .calendar-button.active { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(23, 92, 211, .12); }
     .calendar-button.today { background: #eff6ff; border-color: #84caff; }
     .calendar-button.has-items { background: #f6fef9; border-color: #abefc6; }
+    .calendar-button.outside-month { background: #f8fafc; color: #98a2b3; }
+    .calendar-button.outside-month.has-items { background: #f8fbff; }
     .calendar-day-number { font-size: 13px; }
     .calendar-dot-row { display: flex; gap: 3px; flex-wrap: wrap; }
     .calendar-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--blue); }
@@ -747,7 +757,7 @@ function loginHtml(hasError) {
   </div>`;
 }
 
-function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats }) {
+function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, needsReview, events, cases, documents, notices, manualReview, blockedDocuments, historyItems, runs, stats, calendarMonth }) {
   const runSummary = runs[0]?.summary || runs[0]?.error || "No sync has run yet.";
   const calendarItems = buildCalendarItems(deadlines);
   const meetingItems = calendarItems.filter((item) => item.kind === "Meeting");
@@ -759,6 +769,9 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
       </div>
       <form method="post" action="/sync-now"><button type="submit">Sync Now</button></form>
     </div>
+    ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
+    ${dueNowPanel({ overdue, dueToday, dueTomorrow })}
+    ${meetingPanel(meetingItems)}
     <div class="snapshot">
       <section class="panel">
         <div class="panel-head">
@@ -774,26 +787,23 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           ${simpleCount("Due today", stats.due_today)}
           ${simpleCount("Due tomorrow", stats.due_tomorrow)}
           ${simpleCount("Meetings", meetingItems.length)}
-          ${simpleCount("Manual review", manualReview.length)}
-          ${simpleCount("Blocked PDFs", blockedDocuments.length)}
+          ${simpleCount("Needs a person", manualReview.length)}
+          ${simpleCount("PACER waiting", blockedDocuments.length)}
           ${simpleCount("Due in 7 days", stats.due_soon)}
-          ${simpleCount("Needs date", stats.needs_review)}
+          ${simpleCount("Missing exact date", stats.needs_review)}
           ${simpleCount("Open deadlines", stats.open_deadlines)}
-          ${simpleCount("Docs analyzed", stats.read_documents)}
+          ${simpleCount("PDFs read", stats.read_documents)}
           ${simpleCount("History", stats.history_items)}
         </div>
       </section>
     </div>
-    ${dueNowPanel({ overdue, dueToday, dueTomorrow })}
-    ${meetingPanel(meetingItems)}
-    ${startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments })}
     <div class="notice">The dashboard reads court emails every hour, saves anything it can read, and flags what needs a person. Always verify extracted deadlines against the docket and rules before relying on them.</div>
     <div class="layout">
       <div class="stack">
         ${manualReviewSection(manualReview)}
         <details class="panel">
           <summary class="panel-head">
-            <div><h2>Needs Date</h2><div class="muted">Items where the system found court activity but could not parse an exact calendar date.</div></div>
+            <div><h2>Missing Exact Date</h2><div class="muted">Items with relative or unclear timing. These are not shown as due today or tomorrow until an exact date is known.</div></div>
             <span class="muted">Open</span>
           </summary>
           ${deadlineTable(needsReview, true)}
@@ -802,7 +812,7 @@ function dashboardHtml({ mailbox, deadlines, dueToday, dueTomorrow, overdue, nee
           <div class="panel-head">
             <div><h2>Deadline Calendar</h2><div class="muted">Date ordered, with the email received date shown for every item.</div></div>
           </div>
-          ${calendarPanel(calendarItems)}
+          ${calendarPanel(calendarItems, calendarMonth)}
           ${deadlineTable(deadlines, false)}
         </section>
         <section class="panel">
@@ -893,20 +903,20 @@ function meetingPanel(items) {
 function startHerePanel({ manualReview, needsReview, deadlines, blockedDocuments }) {
   const nextDeadline = deadlines.find((deadline) => deadline.due_at);
   const reviewText = manualReview.length
-    ? `${manualReview.length} active item(s). Check off anything already handled.`
-    : "Nothing urgent is waiting for manual review.";
+    ? `${manualReview.length} item(s) need a person. Open this first.`
+    : "Nothing needs a person right now.";
   const pdfText = blockedDocuments.length
-    ? `${blockedDocuments.length} PDF(s) are blocked by PACER/court response. Click Retry PACER Fetch after checking Render PACER settings.`
-    : "All available PDFs are saved or there are no blocked PDFs.";
+    ? `${blockedDocuments.length} PDF(s) are waiting on PACER. Click Retry PACER Fetch.`
+    : "All available PDFs are saved and readable.";
   return `<section class="panel start-panel">
     <div class="panel-head">
-      <div><h2>Start Here</h2><div class="muted">Use this order every time you open the dashboard.</div></div>
+      <div><h2>Start Here</h2><div class="muted">Do these in order. Green means okay.</div></div>
     </div>
     <div class="steps">
-      ${stepCard("1", "Fix urgent review items", reviewText, manualReview.length ? "review" : "good")}
-      ${stepCard("2", "Fix missing dates", needsReview.length ? `${needsReview.length} item(s) need an exact date.` : "No missing dates right now.", needsReview.length ? "normal" : "good")}
-      ${stepCard("3", "Look at the next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
-      ${stepCard("4", "Let PACER fetch PDFs", pdfText, blockedDocuments.length ? "normal" : "good")}
+      ${stepCard("1", "Do first", reviewText, manualReview.length ? "review" : "good")}
+      ${stepCard("2", "Missing dates", needsReview.length ? `${needsReview.length} item(s) need an exact date.` : "No missing dates right now.", needsReview.length ? "normal" : "good")}
+      ${stepCard("3", "Next deadline", nextDeadline ? `${formatDate(nextDeadline.due_at) || escapeHtml(nextDeadline.date_text || "Date needs review")} - ${escapeHtml(nextDeadline.case_name || "Case pending review")}` : "No open deadlines found yet.", nextDeadline ? "normal" : "review")}
+      ${stepCard("4", "PDFs", pdfText, blockedDocuments.length ? "normal" : "good")}
     </div>
   </section>`;
 }
@@ -943,10 +953,10 @@ function blockedDocumentSection(documents) {
   if (!documents.length) return "";
   return `<details class="panel">
     <summary class="panel-head">
-      <div><h2>PACER PDF Fetch Issues</h2><div class="muted">${documents.length} court document(s) did not return a readable PDF yet.</div></div>
+      <div><h2>PACER Waiting For PDFs</h2><div class="muted">${documents.length} court document(s) did not return a readable PDF yet.</div></div>
       <span class="muted">Open</span>
     </summary>
-    <div class="section-note">${pacerStatusText()} The agent retries these links during each hourly sync. If the reason mentions fees, set PACER_AUTO_ACCEPT_FEES=true in both Render services if you approve PACER charges.</div>
+    <div class="section-note">${pacerStatusText()} The app retries these links every hour and when you press the button. If the reason mentions fees, set PACER_AUTO_ACCEPT_FEES=true in both Render services only if you approve PACER charges.</div>
     <form method="post" action="/documents/retry-blocked" class="inline-action-form">
       <button type="submit">Retry PACER Fetch</button>
     </form>
@@ -957,7 +967,7 @@ function blockedDocumentSection(documents) {
         `<span class="due">${formatDate(doc.received_at) || "Review date pending"}</span>`,
         escapeHtml(doc.case_name || "Case pending review"),
         `<strong>${escapeHtml(doc.filename || "PACER document")}</strong>`,
-        `${escapeHtml(doc.read_status || "download pending")}<br><span class="muted">${escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")}</span>`
+        `${documentStatusTag(doc)}<br><span class="muted">${escapeHtml(doc.document_summary || "PACER has not released the PDF yet. The app will retry automatically on the next sync.")}</span>`
       ])
     )}
   </details>`;
@@ -1220,7 +1230,7 @@ function deadlineTable(deadlines, compact) {
       <div>${archiveButton(`/deadlines/${d.id}/archive`, "Archive deadline")}</div>
       <div class="deadline-main">
         <div class="deadline-when">
-          <span class="due">${formatDate(d.due_at) || escapeHtml(d.date_text || "Needs date")}</span>
+          <span class="due">${displayDueDate(d)}</span>
           ${confidenceTag(d.confidence)}
           <span class="deadline-meta">Email received: ${formatDate(d.received_at) || "Review date pending"}</span>
         </div>
@@ -1234,18 +1244,19 @@ function deadlineTable(deadlines, compact) {
   }).join("")}</div>`;
 }
 
-function calendarPanel(items) {
+function calendarPanel(items, calendarMonth) {
   const upcoming = items.slice(0, 24);
   return `<div class="calendar-panel">
-    <div class="section-note">Upcoming calendar, grouped by day. Meetings and hearings are highlighted in green.</div>
-    ${interactiveCalendar(items)}
+    <div class="section-note">Month view with correct weekday placement. Meetings and hearings are green; deadlines are blue.</div>
+    ${interactiveCalendar(items, calendarMonth)}
     ${upcoming.length ? calendarDays(upcoming) : `<div class="empty">No dated calendar items found yet.</div>`}
   </div>`;
 }
 
-function interactiveCalendar(items) {
-  const today = startOfEasternDay(new Date());
-  const days = Array.from({ length: 35 }, (_, index) => new Date(today.getTime() + index * 24 * 60 * 60 * 1000));
+function interactiveCalendar(items, requestedMonth) {
+  const todayKey = calendarDateKey(new Date());
+  const month = calendarMonthInfo(requestedMonth, todayKey);
+  const days = calendarMonthGrid(month.year, month.month);
   const itemsByDay = new Map();
   for (const item of items) {
     const key = calendarDateKey(item.startsAt);
@@ -1253,7 +1264,10 @@ function interactiveCalendar(items) {
     list.push(item);
     itemsByDay.set(key, list);
   }
-  const initialKey = itemsByDay.has(calendarDateKey(today)) ? calendarDateKey(today) : (items[0] ? calendarDateKey(items[0].startsAt) : calendarDateKey(today));
+  const monthItem = items.find((item) => calendarDateKey(item.startsAt).startsWith(month.key));
+  const initialKey = itemsByDay.has(todayKey) && todayKey.startsWith(month.key)
+    ? todayKey
+    : (monthItem ? calendarDateKey(monthItem.startsAt) : month.key + "-01");
   const safeItems = items.map((item) => ({
     key: calendarDateKey(item.startsAt),
     time: calendarTimeLabel(item),
@@ -1265,13 +1279,21 @@ function interactiveCalendar(items) {
   }));
 
   return `<div class="interactive-calendar">
+    <div class="calendar-toolbar">
+      <div class="calendar-month-title">${escapeHtml(month.label)}</div>
+      <div class="calendar-nav">
+        <a href="/?month=${escapeHtml(month.prev)}">Previous</a>
+        <a href="/">Today</a>
+        <a href="/?month=${escapeHtml(month.next)}">Next</a>
+      </div>
+    </div>
     <div class="calendar-grid">
       ${["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => `<div class="calendar-weekday">${day}</div>`).join("")}
       ${days.map((day) => {
-        const key = calendarDateKey(day);
+        const key = day.key;
         const dayItems = itemsByDay.get(key) || [];
-        return `<button class="calendar-button ${key === calendarDateKey(today) ? "today" : ""} ${dayItems.length ? "has-items" : ""} ${key === initialKey ? "active" : ""}" type="button" data-calendar-day="${key}">
-          <span class="calendar-day-number">${Number(key.slice(-2))}</span>
+        return `<button class="calendar-button ${key === todayKey ? "today" : ""} ${day.inMonth ? "" : "outside-month"} ${dayItems.length ? "has-items" : ""} ${key === initialKey ? "active" : ""}" type="button" data-calendar-day="${key}">
+          <span class="calendar-day-number">${day.day}</span>
           <span class="calendar-dot-row">${dayItems.slice(0, 4).map((item) => `<span class="calendar-dot ${item.kind === "Meeting" ? "meeting" : ""}"></span>`).join("")}</span>
           ${dayItems.length ? `<span class="deadline-meta">${dayItems.length} item${dayItems.length === 1 ? "" : "s"}</span>` : ""}
         </button>`;
@@ -1288,7 +1310,7 @@ function interactiveCalendar(items) {
         const title = document.getElementById("calendar-selected-title");
         const target = document.getElementById("calendar-selected-items");
         const items = (window.calendarItems || []).filter((item) => item.key === key);
-        title.textContent = new Date(key + "T12:00:00-04:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+        title.textContent = new Date(key + "T12:00:00").toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric", year: "numeric" });
         target.innerHTML = items.length ? items.map((item) => '<div class="calendar-item"><div class="calendar-time">' + escapeClient(item.time) + '</div><div><div class="calendar-title">' + escapeClient(item.title) + ' <span class="calendar-kind ' + (item.kind === "Meeting" ? "meeting" : "") + '">' + escapeClient(item.kind) + '</span></div><div class="calendar-case">' + escapeClient(item.caseName) + (item.caseNumber ? ' | ' + escapeClient(item.caseNumber) : '') + '</div>' + (item.source ? '<div class="calendar-case">' + escapeClient(item.source) + '</div>' : '') + '</div></div>').join("") : '<div class="empty">Nothing scheduled for this day.</div>';
       }
       function escapeClient(value) {
@@ -1428,8 +1450,16 @@ function caseDeadlineList(deadlines) {
     ${deadlines.map((deadline) => `
       <div class="case-deadline-row">
         <div>${archiveButton(`/deadlines/${deadline.id}/archive`, "Archive deadline")}</div>
-        <div><span class="due">${formatDate(deadline.due_at) || escapeHtml(deadline.date_text || "Needs review")}</span><br>${confidenceTag(deadline.confidence)}<br><span class="muted">Email: ${formatDate(deadline.received_at) || "Review date pending"}</span></div>
-        <div><strong>${escapeHtml(deadline.label)}</strong>${deadline.source_quote ? `<br><span class="muted">${escapeHtml(deadline.source_quote)}</span>` : ""}<br><span class="muted">${escapeHtml(deadline.subject || "")}</span></div>
+        <div>
+          <div class="case-deadline-top">
+            <span class="due">${displayDueDate(deadline)}</span>
+            ${confidenceTag(deadline.confidence)}
+            <span class="muted">Email: ${formatDate(deadline.received_at) || "Review date pending"}</span>
+          </div>
+          <div class="case-deadline-title">${escapeHtml(cleanDeadlineLabel(deadline.label))}</div>
+          <div class="deadline-meta">${escapeHtml(deadline.subject || "")}</div>
+          ${deadline.source_quote ? `<details class="document-viewer"><summary>Show source text</summary><div class="document-preview">${escapeHtml(deadline.source_quote)}</div></details>` : ""}
+        </div>
       </div>
     `).join("")}
   </div>`;
@@ -1450,12 +1480,12 @@ function documentList(caseId, documents) {
         <div>
           <div class="document-name">${escapeHtml(doc.filename)}</div>
           ${doc.document_type ? `<div><span class="tag">${escapeHtml(doc.document_type)}</span></div>` : ""}
-          <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${escapeHtml(doc.read_status || "pending")}${doc.received_at ? ` · Email received: ${formatDate(doc.received_at)}` : ""}</div>
+          <div class="muted">${escapeHtml(sourceLabel(doc.source_type))} · ${escapeHtml(doc.mime_type || "file")} · ${formatBytes(doc.size_bytes)} · ${documentStatusTag(doc)}${doc.received_at ? ` · Email received: ${formatDate(doc.received_at)}` : ""}</div>
           ${doc.document_summary ? `<div class="document-summary">${escapeHtml(doc.document_summary)}</div>` : ""}
           ${doc.extracted_text ? `<div class="document-preview">${escapeHtml(doc.extracted_text.slice(0, 320))}${doc.extracted_text.length > 320 ? "..." : ""}</div>` : ""}
         </div>
         <div class="document-actions">
-          <a class="document-link" href="/documents/${doc.id}/view" target="_blank" rel="noopener">Open</a>
+          <a class="document-link" href="/documents/${doc.id}/view" target="_blank" rel="noopener">${isInlinePdf(doc) ? "View PDF" : "Open"}</a>
           <a class="document-link" href="/documents/${doc.id}/download">Download</a>
         </div>
       </div>
@@ -1485,6 +1515,24 @@ function isInlinePdf(doc) {
   return String(doc.read_status || "") === "read" && (mimeType.includes("pdf") || filename.endsWith(".pdf"));
 }
 
+function displayDueDate(deadline) {
+  if (deadline?.due_at) return escapeHtml(formatDate(deadline.due_at));
+  const dateText = String(deadline?.date_text || "").trim();
+  if (/^(?:within|no later than|not later than|on or before|before|after)\b/i.test(dateText)) {
+    return "Missing exact date";
+  }
+  return escapeHtml(dateText || "Missing exact date");
+}
+
+function documentStatusTag(doc) {
+  const status = String(doc?.read_status || "pending");
+  if (status === "read") return `<span class="tag high">PDF read</span>`;
+  if (status === "notice_read_pdf_blocked") return `<span class="tag review">PACER waiting</span>`;
+  if (status.startsWith("download_error:")) return `<span class="tag review">PACER blocked</span>`;
+  if (status.startsWith("read_error:")) return `<span class="tag review">Could not read text</span>`;
+  return `<span class="tag">${escapeHtml(status.replaceAll("_", " "))}</span>`;
+}
+
 function sourceLabel(sourceType) {
   if (sourceType === "ecf_link") return "ECF link";
   if (sourceType === "manual_upload") return "uploaded";
@@ -1510,6 +1558,55 @@ function table(headers, rows) {
 
 function caseLabel(row) {
   return `${escapeHtml(row.case_name || "Case pending review")}<br><span class="muted">${escapeHtml([row.court, row.case_number].filter(Boolean).join(" | "))}</span>`;
+}
+
+function calendarMonthInfo(requestedMonth, todayKey) {
+  const todayParts = parseDateKey(todayKey);
+  const match = String(requestedMonth || "").match(/^(\d{4})-(\d{2})$/);
+  const year = match ? Number(match[1]) : todayParts.year;
+  const month = match ? Number(match[2]) : todayParts.month;
+  const current = new Date(Date.UTC(year, month - 1, 1, 12));
+  const prev = new Date(Date.UTC(year, month - 2, 1, 12));
+  const next = new Date(Date.UTC(year, month, 1, 12));
+  return {
+    year,
+    month,
+    key: monthKey(year, month),
+    prev: monthKey(prev.getUTCFullYear(), prev.getUTCMonth() + 1),
+    next: monthKey(next.getUTCFullYear(), next.getUTCMonth() + 1),
+    label: new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric" }).format(current)
+  };
+}
+
+function calendarMonthGrid(year, month) {
+  const first = new Date(Date.UTC(year, month - 1, 1, 12));
+  const startOffset = first.getUTCDay();
+  const gridStart = new Date(Date.UTC(year, month - 1, 1 - startOffset, 12));
+  return Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(gridStart.getTime() + index * 24 * 60 * 60 * 1000);
+    return {
+      key: dateKey(date.getUTCFullYear(), date.getUTCMonth() + 1, date.getUTCDate()),
+      day: date.getUTCDate(),
+      inMonth: date.getUTCFullYear() === year && date.getUTCMonth() + 1 === month
+    };
+  });
+}
+
+function parseDateKey(key) {
+  const match = String(key || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) {
+    const now = new Date();
+    return { year: now.getFullYear(), month: now.getMonth() + 1, day: now.getDate() };
+  }
+  return { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+}
+
+function monthKey(year, month) {
+  return `${String(year).padStart(4, "0")}-${String(month).padStart(2, "0")}`;
+}
+
+function dateKey(year, month, day) {
+  return `${monthKey(year, month)}-${String(day).padStart(2, "0")}`;
 }
 
 function calendarDateLabel(value) {

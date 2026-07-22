@@ -83,7 +83,7 @@ async function extractWithOpenAI(email) {
       {
         role: "system",
         content:
-          "Extract structured data from PACER/CM-ECF court notice emails and any attached/read PDF document text. Return strict JSON. Be exhaustive about dates attorneys may need: response deadlines, objection deadlines, hearing dates, trial dates, status conferences, 341 meetings, claim deadlines, confirmation hearings, service/filing due dates, payment/change/cure dates, and dates hidden in docket text, orders, notices, motions, proofs of claim, certificates, or document text. Treat every date in a filed court PDF as potentially important unless clearly irrelevant. Do not invent dates. If a date may matter but the legal meaning is unclear, include it with confidence needs_review and quote the source."
+          "Extract structured data from PACER/CM-ECF court notice emails and any attached/read PDF document text. Return strict JSON. Be exhaustive about actionable dates attorneys may need: response deadlines, objection deadlines, hearing dates, trial dates, status conferences, 341 meetings, claim deadlines, confirmation hearings, service/filing due dates, payment/change/cure dates, and dates hidden in docket text, orders, notices, motions, proofs of claim, certificates, or document text. Do not treat ordinary notice, received, entered, filed, electronic-stamp, or service-list dates as deadlines unless the text separately says a response, objection, hearing, payment, cure, service, filing, or appearance is due/scheduled on that date. Do not invent dates. If a relative deadline appears, include the exact relative wording with dueAt null unless the source also gives a calculable trigger date."
       },
       {
         role: "user",
@@ -226,6 +226,7 @@ function addSafetyNetDates(email, extraction) {
   for (const match of body.matchAll(ABSOLUTE_DATE_PATTERN)) {
     const context = contextAround(body, match.index, match[0].length);
     if (isNonActionableDateContext(context)) continue;
+    if (!isActionableDateContext(context)) continue;
     const parsedDate = parseDate(match[0]);
     const key = normalizeDateKey(match[0]);
     const parsedKey = normalizeDateKey(parsedDate || "");
@@ -236,7 +237,7 @@ function addSafetyNetDates(email, extraction) {
       label: labelForDateContext(context, match[0]),
       dueAt: parsedDate,
       dateText: match[0],
-      confidence: parsedDate ? "medium" : "needs_review",
+      confidence: confidenceForDateContext(context, parsedDate),
       sourceQuote: context
     });
   }
@@ -247,7 +248,7 @@ function addSafetyNetDates(email, extraction) {
     if (!key || existing.has(key)) continue;
     existing.add(key);
     additions.push({
-      label: `Possible relative deadline: ${match[0].slice(0, 100)}`,
+      label: `Needs exact date: ${match[0].slice(0, 100)}`,
       dueAt: null,
       dateText: match[0],
       confidence: "needs_review",
@@ -276,7 +277,19 @@ function labelForDateContext(context, dateText) {
   if (lower.includes("cure")) return `Cure deadline: ${dateText}`;
   if ((lower.includes("serve") || lower.includes("service")) && /\b(?:deadline|due|must|shall|required|ordered|no later|on or before|by)\b/i.test(lower)) return `Service deadline: ${dateText}`;
   if (lower.includes("appear")) return `Appearance/hearing date: ${dateText}`;
-  return `Court date/deadline: ${dateText}`;
+  return `Important court date: ${dateText}`;
+}
+
+function confidenceForDateContext(context, parsedDate) {
+  if (!parsedDate) return "needs_review";
+  const lower = String(context || "").toLowerCase();
+  if (/\b(?:hearing|conference|trial|341|meeting|objection|response|reply|deadline|due|bar date|confirmation)\b/.test(lower)) return "high";
+  return "medium";
+}
+
+function isActionableDateContext(context) {
+  const lower = String(context || "").toLowerCase();
+  return /\b(?:deadline|due|must|shall|required|ordered|no later|not later|on or before|by|set for|scheduled for|continued to|hearing|conference|trial|341|meeting|appearance|appear|objection|response|reply|claim deadline|bar date|confirmation|cure|payment|serve|service)\b/.test(lower);
 }
 
 function isNonActionableDateContext(context) {
