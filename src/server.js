@@ -594,7 +594,7 @@ app.listen(config.port, () => {
 });
 
 if (config.databaseUrl) {
-  dbReady = withTimeout(initDb(), 25000, "Database startup timed out after 25 seconds")
+  dbReady = initDb()
     .then(() => {
       dbStatus = "ready";
       console.log("PACER dashboard database ready");
@@ -604,13 +604,6 @@ if (config.databaseUrl) {
       dbStartupError = error;
       console.error("PACER dashboard database startup failed:", error);
     });
-}
-
-function withTimeout(promise, ms, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
-  ]);
 }
 
 function layout(title, body) {
@@ -788,7 +781,7 @@ function databaseErrorHtml(error) {
     <div class="panel-body">
       <p>The dashboard opened its web port, but it could not connect to the Render database yet.</p>
       <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
-      <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>, then redeploy.</p>
+      <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>. In Render, this should come from the database connection string, not a manually typed placeholder.</p>
     </div>
   </div>`;
 }
@@ -798,7 +791,7 @@ function databaseStartingHtml() {
     <div class="panel-head"><h2>Dashboard is starting</h2></div>
     <div class="panel-body">
       <p>The web service is online. It is connecting to the Render database now.</p>
-      <p class="muted">Refresh this page in about 30 seconds. If it stays here, check the Render logs for a database connection error.</p>
+      <p class="muted">Refresh this page in about 30 seconds. If it stays here for several minutes, check the Render logs and confirm DATABASE_URL points to pacer-deadlines-db.</p>
     </div>
   </div>`;
 }
