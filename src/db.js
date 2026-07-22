@@ -13,7 +13,15 @@ export const pool = new Pool({
 });
 
 export async function initDb() {
-  await ensureCoreSchema();
+  try {
+    await ensureCoreSchema();
+  } catch (error) {
+    if (!(isLockTimeout(error) && (await existingSchemaIsUsable()))) {
+      throw error;
+    }
+
+    console.warn("PACER dashboard schema setup hit a lock, but the existing schema is usable. Continuing startup.");
+  }
 
   ensureIndexes().catch((error) => {
     console.warn("PACER dashboard background index setup failed:", error.message);
@@ -153,6 +161,53 @@ async function ensureIndexes() {
   for (const statement of statements) {
     await pool.query(statement);
   }
+}
+
+function isLockTimeout(error) {
+  return error?.code === "55P03" || /lock timeout/i.test(error?.message || "");
+}
+
+async function existingSchemaIsUsable() {
+  const requiredTables = ["mailboxes", "emails", "cases", "docket_events", "deadlines", "documents", "sync_runs"];
+  const tableResult = await pool.query(
+    `select table_name
+     from information_schema.tables
+     where table_schema = 'public'
+       and table_name = any($1)`,
+    [requiredTables]
+  );
+  const foundTables = new Set(tableResult.rows.map((row) => row.table_name));
+  if (!requiredTables.every((table) => foundTables.has(table))) return false;
+
+  const requiredColumns = [
+    ["docket_events", "status"],
+    ["docket_events", "archived_at"],
+    ["deadlines", "archived_at"],
+    ["emails", "review_status"],
+    ["emails", "archived_at"],
+    ["documents", "extracted_text"],
+    ["documents", "document_type"],
+    ["documents", "document_summary"],
+    ["documents", "read_status"],
+    ["documents", "source_url"],
+    ["documents", "source_type"],
+    ["documents", "updated_at"],
+    ["documents", "review_status"],
+    ["documents", "archived_at"],
+    ["sync_runs", "document_count"]
+  ];
+
+  const columnResult = await pool.query(
+    `select table_name, column_name
+     from information_schema.columns
+     where table_schema = 'public'
+       and (table_name, column_name) in (
+         ${requiredColumns.map((_, index) => `($${index * 2 + 1}, $${index * 2 + 2})`).join(", ")}
+       )`,
+    requiredColumns.flat()
+  );
+  const foundColumns = new Set(columnResult.rows.map((row) => `${row.table_name}.${row.column_name}`));
+  return requiredColumns.every(([table, column]) => foundColumns.has(`${table}.${column}`));
 }
 
 export async function upsertMailbox(email, refreshToken) {

@@ -809,6 +809,7 @@ function databaseErrorHtml(error) {
       <p class="muted">${escapeHtml(error?.message || "Database startup failed.")}</p>
       <p class="muted">Attempt ${dbStartupAttempts}. Last failed: ${escapeHtml(lastError)}. ${escapeHtml(retryText)}</p>
       <p>Check that the web service has a valid <strong>DATABASE_URL</strong> connected to <strong>pacer-deadlines-db</strong>. In Render, this should come from the database connection string, not a manually typed placeholder.</p>
+      <p>If this says <strong>lock timeout</strong>, the database is busy with another deploy, cron sync, migration, or stuck query. Cancel extra deploys, wait until only one deploy is running, restart <strong>pacer-deadlines-db</strong>, then restart this web service.</p>
       <p>If this says <strong>Query read timeout</strong>, Render reached Postgres but Postgres did not answer in time. Restart the Render database, then restart the web service. If it still happens, create a fresh Render database and reconnect <strong>DATABASE_URL</strong>.</p>
       <p class="muted">If Render is deploying from GitHub, make sure the GitHub repo contains this Node app at the repo root: package.json, render.yaml, and the src folder.</p>
     </div>
