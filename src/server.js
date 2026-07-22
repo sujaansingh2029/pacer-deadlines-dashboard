@@ -27,6 +27,10 @@ async function waitForDatabase() {
   await dbReady;
 }
 
+function asyncRoute(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(cookieParser(config.sessionSecret));
@@ -60,7 +64,7 @@ app.use((req, res, next) => {
   return res.redirect("/login");
 });
 
-app.get("/", async (req, res) => {
+app.get("/", asyncRoute(async (req, res) => {
   const missing = assertRequiredConfig();
   if (missing.length) return res.send(layout("Setup Required", setupHtml(missing)));
   if (dbStartupError) return res.status(500).send(layout("Database Error", databaseErrorHtml(dbStartupError)));
@@ -245,7 +249,7 @@ app.get("/", async (req, res) => {
     stats: stats.rows[0],
     calendarMonth: String(req.query.month || "")
   })));
-});
+}));
 
 function loadHistoryItems() {
   return pool.query(`
@@ -341,7 +345,7 @@ app.get("/auth/google", (_req, res) => {
   res.redirect(authUrl());
 });
 
-app.get("/oauth2callback", async (req, res) => {
+app.get("/oauth2callback", asyncRoute(async (req, res) => {
   await waitForDatabase();
   const { code } = req.query;
   if (!code) return res.status(400).send("Missing OAuth code.");
@@ -351,9 +355,9 @@ app.get("/oauth2callback", async (req, res) => {
   }
   await upsertMailbox(email, tokens.refresh_token);
   res.redirect("/");
-});
+}));
 
-app.post("/api/sync", async (req, res) => {
+app.post("/api/sync", asyncRoute(async (req, res) => {
   const provided = req.get("x-cron-secret") || req.query.secret || req.body.secret;
   if (provided !== config.cronSecret) return res.status(401).json({ error: "Unauthorized" });
   await waitForDatabase();
@@ -361,46 +365,46 @@ app.post("/api/sync", async (req, res) => {
   if (!mailbox) return res.json({ ok: true, summary: "No Gmail mailbox is connected yet." });
   const result = await syncMailbox(mailbox);
   res.json({ ok: true, ...result });
-});
+}));
 
-app.post("/sync-now", async (_req, res) => {
+app.post("/sync-now", asyncRoute(async (_req, res) => {
   await waitForDatabase();
   const mailbox = await getPrimaryMailbox();
   if (mailbox) await syncMailbox(mailbox);
   res.redirect("/");
-});
+}));
 
-app.post("/deadlines/:id/archive", async (req, res) => {
+app.post("/deadlines/:id/archive", asyncRoute(async (req, res) => {
   await waitForDatabase();
   await pool.query("update deadlines set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
-});
+}));
 
-app.post("/events/:id/archive", async (req, res) => {
+app.post("/events/:id/archive", asyncRoute(async (req, res) => {
   await waitForDatabase();
   await pool.query("update docket_events set status = 'archived', archived_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
-});
+}));
 
-app.post("/emails/:id/archive", async (req, res) => {
+app.post("/emails/:id/archive", asyncRoute(async (req, res) => {
   await waitForDatabase();
   await pool.query("update emails set review_status = 'archived', archived_at = now() where gmail_id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
-});
+}));
 
-app.post("/documents/:id/archive", async (req, res) => {
+app.post("/documents/:id/archive", asyncRoute(async (req, res) => {
   await waitForDatabase();
   await pool.query("update documents set review_status = 'archived', archived_at = now(), updated_at = now() where id = $1", [req.params.id]);
   res.redirect(req.get("referer") || "/");
-});
+}));
 
-app.post("/documents/retry-blocked", async (req, res) => {
+app.post("/documents/retry-blocked", asyncRoute(async (req, res) => {
   await waitForDatabase();
   await retryBlockedDocuments();
   res.redirect(req.get("referer") || "/");
-});
+}));
 
-app.post("/cases/:id/documents", upload.single("document"), async (req, res) => {
+app.post("/cases/:id/documents", upload.single("document"), asyncRoute(async (req, res) => {
   await waitForDatabase();
   const caseId = Number(req.params.id);
   const caseResult = await pool.query("select id, case_name, court, case_number, judge from cases where id = $1", [caseId]);
@@ -440,7 +444,7 @@ app.post("/cases/:id/documents", upload.single("document"), async (req, res) => 
     await saveDeadlinesFromUploadedDocument(caseResult.rows[0], attachment.filename, extracted.text);
   }
   res.redirect(req.get("referer") || "/");
-});
+}));
 
 async function saveDeadlinesFromUploadedDocument(caseRow, filename, text) {
   const extraction = await extractNotice({
@@ -488,7 +492,7 @@ async function saveDeadlinesFromUploadedDocument(caseRow, filename, text) {
   }
 }
 
-app.get("/documents/:id/download", async (req, res) => {
+app.get("/documents/:id/download", asyncRoute(async (req, res) => {
   await waitForDatabase();
   const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
@@ -497,9 +501,9 @@ app.get("/documents/:id/download", async (req, res) => {
   res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
   res.setHeader("Content-Disposition", `attachment; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
   res.send(doc.content);
-});
+}));
 
-app.get("/documents/:id/view", async (req, res) => {
+app.get("/documents/:id/view", asyncRoute(async (req, res) => {
   await waitForDatabase();
   const doc = await loadDocumentForServing(req.params.id);
   if (!doc) return res.status(404).send("Document not found.");
@@ -508,7 +512,7 @@ app.get("/documents/:id/view", async (req, res) => {
   res.setHeader("Content-Type", doc.mime_type || "application/octet-stream");
   res.setHeader("Content-Disposition", `inline; filename="${String(doc.filename || "document").replaceAll('"', "")}"`);
   res.send(doc.content);
-});
+}));
 
 async function loadDocumentForServing(id) {
   const result = await pool.query(
@@ -558,7 +562,7 @@ function documentUnavailableHtml(doc, action) {
   );
 }
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", asyncRoute(async (req, res) => {
   await waitForDatabase();
   const question = String(req.body?.question || "").trim();
   if (!question) return res.status(400).json({ error: "Ask a question first." });
@@ -592,15 +596,7 @@ app.post("/api/chat", async (req, res) => {
     console.error(error);
     res.status(500).json({ error: "The AI chat could not answer right now." });
   }
-});
-
-app.listen(config.port, () => {
-  console.log(`PACER dashboard listening on ${config.port}`);
-});
-
-if (config.databaseUrl) {
-  startDatabaseStartup();
-}
+}));
 
 function startDatabaseStartup() {
   if (dbRetryTimer) {
@@ -628,6 +624,31 @@ function startDatabaseStartup() {
       console.error("PACER dashboard database startup failed:", error);
       dbRetryTimer = setTimeout(startDatabaseStartup, 30000);
     });
+}
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) return next(error);
+
+  console.error("PACER dashboard request failed:", error);
+  const status = isDatabaseBusyError(error) ? 503 : 500;
+  if (req.path.startsWith("/api/")) {
+    return res.status(status).json({
+      error: isDatabaseBusyError(error)
+        ? "The dashboard database is busy. Try again in a minute."
+        : "The dashboard could not finish that request.",
+      detail: error?.message || "Unexpected server error."
+    });
+  }
+
+  return res.status(status).send(layout("Dashboard Temporarily Busy", requestErrorHtml(error)));
+});
+
+app.listen(config.port, () => {
+  console.log(`PACER dashboard listening on ${config.port}`);
+});
+
+if (config.databaseUrl) {
+  startDatabaseStartup();
 }
 
 function layout(title, body) {
@@ -814,6 +835,29 @@ function databaseErrorHtml(error) {
       <p class="muted">If Render is deploying from GitHub, make sure the GitHub repo contains this Node app at the repo root: package.json, render.yaml, and the src folder.</p>
     </div>
   </div>`;
+}
+
+function requestErrorHtml(error) {
+  const busy = isDatabaseBusyError(error);
+  return `<div class="panel">
+    <div class="panel-head"><h2>${busy ? "Dashboard is almost ready" : "Something went wrong"}</h2></div>
+    <div class="panel-body">
+      <p>${busy ? "The app is running, but the database is still busy finishing the last deploy or restart." : "The app could not finish loading this page."}</p>
+      <p class="muted">${escapeHtml(error?.message || "Unexpected server error.")}</p>
+      <p>${busy ? "Wait about 60 seconds, then refresh. If this keeps happening, cancel extra Render deploys and restart the web service once." : "Refresh the page. If it keeps happening, check the latest Render logs."}</p>
+      <a class="button" href="/">Refresh dashboard</a>
+    </div>
+  </div>`;
+}
+
+function isDatabaseBusyError(error) {
+  const message = String(error?.message || "");
+  return (
+    error?.code === "55P03" ||
+    /lock timeout/i.test(message) ||
+    /query read timeout/i.test(message) ||
+    /statement timeout/i.test(message)
+  );
 }
 
 function databaseStartingHtml() {
