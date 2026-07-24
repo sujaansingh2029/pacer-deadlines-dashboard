@@ -216,6 +216,7 @@ app.get("/", asyncRoute(async (req, res) => {
         and (
           doc.read_status like 'download_error:%'
           or doc.read_status = 'notice_read_pdf_blocked'
+          or doc.read_status = 'notice_details_read_pdf_blocked'
         )
       order by coalesce(e.received_at, doc.created_at) desc
       limit 50
@@ -231,8 +232,8 @@ app.get("/", asyncRoute(async (req, res) => {
         (select count(*) from deadlines where status = 'open' and due_at is null) as needs_review,
         (select count(*) from docket_events where status = 'open') as open_events,
         (select count(*) from documents) as documents,
-        (select count(*) from documents where read_status = 'read') as read_documents,
-        (select count(*) from documents where read_status <> 'read') as unread_documents,
+        (select count(*) from documents where read_status in ('read', 'notice_details_read_pdf_blocked')) as read_documents,
+        (select count(*) from documents where read_status not in ('read', 'notice_details_read_pdf_blocked')) as unread_documents,
         ((select count(*) from deadlines where status <> 'open') + (select count(*) from docket_events where status <> 'open') + (select count(*) from emails where coalesce(review_status, 'open') <> 'open') + (select count(*) from documents where coalesce(review_status, 'open') <> 'open')) as history_items
     `);
 
@@ -618,6 +619,9 @@ function readableDocumentBlockReason(doc) {
   const summary = String(doc.document_summary || "");
   if (/two-factor|2fa|verification code|authentication code|security code|mfa/i.test(`${status}\n${summary}`)) {
     return "PACER is asking for a two-factor code before releasing the PDF.";
+  }
+  if (status === "notice_details_read_pdf_blocked") {
+    return "The actual PDF is still blocked, but the dashboard analyzed the court email details for this document.";
   }
   if (/fee|charge|billing/i.test(`${status}\n${summary}`)) {
     return "PACER is asking for fee approval before releasing the PDF.";
@@ -1140,10 +1144,17 @@ function commandCenterPanel({ dueToday, dueTomorrow, needsReview, blockedDocumen
   const tomorrowCount = Number(stats.due_tomorrow || dueTomorrow.length || 0);
   const missingDateCount = Number(stats.needs_review || needsReview.length || 0);
   const pacerWaitingCount = blockedDocuments.length;
+  const emailDetailsReadCount = blockedDocuments.filter((doc) => doc.read_status === "notice_details_read_pdf_blocked").length;
+  const pacerTitle = pacerWaitingCount && emailDetailsReadCount === pacerWaitingCount ? "PDFs missing, details read" : pacerWaitingCount ? "Waiting on PACER" : "PDFs look good";
+  const pacerText = pacerWaitingCount && emailDetailsReadCount
+    ? `${emailDetailsReadCount} notice detail(s) analyzed; retry for actual PDFs.`
+    : pacerWaitingCount
+      ? "Retry fetch after PACER login/fees are confirmed."
+      : "No blocked PACER PDF requests on the first page.";
   return `<section class="command-grid">
     ${commandCard("Do today", todayCount, todayCount ? "Deadlines due today" : "Nothing due today", todayCount ? "Handle these first." : "No same-day deadline found.", todayCount ? "today" : "good")}
     ${commandCard("Tomorrow", tomorrowCount, tomorrowCount ? "Deadlines due tomorrow" : "Nothing due tomorrow", tomorrowCount ? "Prepare these now." : "Tomorrow looks clear.", tomorrowCount ? "waiting" : "good")}
-    ${commandCard("PACER PDFs", pacerWaitingCount, pacerWaitingCount ? "Waiting on PACER" : "PDFs look good", pacerWaitingCount ? "Retry fetch after PACER login/fees are confirmed." : "No blocked PACER PDF requests on the first page.", pacerWaitingCount ? "urgent" : "good")}
+    ${commandCard("PACER PDFs", pacerWaitingCount, pacerTitle, pacerText, pacerWaitingCount ? "urgent" : "good")}
     ${commandCard("Need exact date", missingDateCount, missingDateCount ? "Dates need cleanup" : "Dates look clean", missingDateCount ? "These have relative dates like 'within 14 days'." : "No open extracted item is missing a date.", missingDateCount ? "today" : "good")}
   </section>`;
 }
@@ -1161,7 +1172,7 @@ function systemStatusPanel({ pacerState, runs, stats }) {
   const lastRun = runs[0];
   const totalDocs = Number(stats.documents || 0);
   const readDocs = Number(stats.read_documents || 0);
-  const readText = totalDocs ? `${readDocs} of ${totalDocs} saved document(s) readable` : "No saved documents yet";
+  const readText = totalDocs ? `${readDocs} of ${totalDocs} document(s) or notice detail(s) readable` : "No saved documents yet";
   const syncText = lastRun
     ? `${lastRun.error ? "Last sync had an error" : "Last sync finished"}: ${formatDate(lastRun.finished_at || lastRun.started_at)}`
     : "No sync has run yet";
@@ -1178,7 +1189,7 @@ function systemStatusPanel({ pacerState, runs, stats }) {
     <div class="status-card ${readDocs ? "good" : "warn"}">
       <div class="command-label">Documents</div>
       <div class="command-title">${escapeHtml(readText)}</div>
-      <div class="command-text">Readable PDFs are scanned for deadlines and grouped under each case.</div>
+      <div class="command-text">Readable PDFs and court email details are scanned for deadlines and grouped under each case.</div>
     </div>
     <div class="status-card ${lastRun?.error ? "bad" : "good"}">
       <div class="command-label">Sync</div>
@@ -1200,12 +1211,16 @@ function pacerConnectionState(blockedDocuments, stats) {
     };
   }
   if (blockedDocuments.length) {
+    const breakdown = blockedDocumentBreakdown(blockedDocuments);
+    const emailDetailsReadCount = blockedDocuments.filter((doc) => doc.read_status === "notice_details_read_pdf_blocked").length;
     return {
       tone: config.pacerAutoAcceptFees ? "warn" : "bad",
-      title: config.pacerAutoAcceptFees ? "PACER connected, PDFs still blocked" : "PACER needs fee setting",
+      title: emailDetailsReadCount
+        ? "Court email details are being analyzed"
+        : config.pacerAutoAcceptFees ? "PACER connected, PDFs still blocked" : "PACER needs fee setting",
       text: config.pacerAutoAcceptFees
-        ? `${blockedDocuments.length} document(s) still returned an HTML/login/fee page. Press Retry PACER Fetch after deploy.`
-        : `${blockedDocuments.length} PDF(s) are waiting. If PACER asks for fees, set PACER_AUTO_ACCEPT_FEES=true only if you approve charges.`
+        ? `${blockedDocuments.length} PDF(s) still blocked; ${emailDetailsReadCount} have court email details analyzed. ${breakdown || "Open PACER Waiting For PDFs for details."}`
+        : `${blockedDocuments.length} PDF(s) are waiting; ${emailDetailsReadCount} have court email details analyzed. ${breakdown || "If PACER asks for fees, set PACER_AUTO_ACCEPT_FEES=true only if approved."}`
     };
   }
   return {
@@ -1296,12 +1311,14 @@ function manualReviewSection(items) {
 
 function blockedDocumentSection(documents) {
   if (!documents.length) return "";
+  const breakdown = blockedDocumentBreakdown(documents);
   return `<details class="panel">
     <summary class="panel-head">
       <div><h2>PACER Waiting For PDFs</h2><div class="muted">${documents.length} court document(s) did not return a readable PDF yet.</div></div>
       <span class="muted">Open</span>
     </summary>
     <div class="section-note">${pacerStatusText()} The app retries these links every hour and when you press the button. If PACER asks for a fee, turn on PACER_AUTO_ACCEPT_FEES only if the firm approves PACER charges.</div>
+    ${breakdown ? `<div class="section-note"><strong>Current blocker:</strong> ${breakdown}</div>` : ""}
     <form method="post" action="/documents/retry-blocked" class="inline-action-form">
       <button type="submit">Retry PACER Fetch</button>
       <a class="button secondary-button" href="/pacer-setup">Enter PACER 2FA Code</a>
@@ -1316,11 +1333,40 @@ function blockedDocumentSection(documents) {
           </div>
           <div class="deadline-title">${escapeHtml(doc.filename || "PACER document")}</div>
           <div class="deadline-case">${escapeHtml(doc.case_name || "Case pending review")}</div>
+          <div class="muted">${escapeHtml(documentBlockReason(doc))}</div>
           <div class="deadline-source">${escapeHtml(doc.document_summary || "PACER returned a web page instead of a readable PDF. The app will retry automatically on the next sync.")}</div>
         </div>
       </div>`).join("")}
     </div>
   </details>`;
+}
+
+function blockedDocumentBreakdown(documents) {
+  const counts = { analyzed: 0, fee: 0, twoFactor: 0, login: 0, court: 0 };
+  for (const doc of documents) {
+    const reason = documentBlockReason(doc).toLowerCase();
+    if (doc.read_status === "notice_details_read_pdf_blocked") counts.analyzed += 1;
+    else if (/fee|charge|billing|cost/.test(reason)) counts.fee += 1;
+    else if (/two-factor|2fa|verification|authentication code|security code|mfa/.test(reason)) counts.twoFactor += 1;
+    else if (/login|authenticate|password|username/.test(reason)) counts.login += 1;
+    else counts.court += 1;
+  }
+  return [
+    counts.analyzed ? `${counts.analyzed} have court email details analyzed while the PDF is still blocked` : "",
+    counts.fee ? `${counts.fee} need PACER fee approval` : "",
+    counts.twoFactor ? `${counts.twoFactor} need PACER 2FA` : "",
+    counts.login ? `${counts.login} need PACER login/session` : "",
+    counts.court ? `${counts.court} returned a court/PACER page instead of a PDF` : ""
+  ].filter(Boolean).join("; ");
+}
+
+function documentBlockReason(doc) {
+  const status = String(doc.read_status || "");
+  if (status.startsWith("download_error:")) return status.replace(/^download_error:\s*/i, "").trim();
+  if (status === "notice_details_read_pdf_blocked") return "PDF blocked; court email details analyzed.";
+  if (status === "notice_read_pdf_blocked") return "Older blocked attempt. Click Retry PACER Fetch to get the exact PACER reason.";
+  if (status.startsWith("read_error:")) return status.replace(/^read_error:\s*/i, "PDF saved but could not be read: ").trim();
+  return "PACER did not return a readable PDF.";
 }
 
 function pacerStatusText() {
@@ -1878,6 +1924,7 @@ function documentStatusTag(doc) {
   const status = String(doc?.read_status || "pending");
   if (status === "read") return `<span class="tag high">PDF read</span>`;
   if (status === "notice_read_pdf_blocked") return `<span class="tag review">PACER waiting</span>`;
+  if (status === "notice_details_read_pdf_blocked") return `<span class="tag high">Email details read</span>`;
   if (status.startsWith("download_error:")) return `<span class="tag review">PACER blocked</span>`;
   if (status.startsWith("read_error:")) return `<span class="tag review">Could not read text</span>`;
   return `<span class="tag">${escapeHtml(status.replaceAll("_", " "))}</span>`;

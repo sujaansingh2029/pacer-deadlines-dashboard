@@ -1,0 +1,99 @@
+services:
+  - type: web
+    name: pacer-deadlines-dashboard
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pacer-deadlines-db
+          property: connectionString
+      - key: APP_BASE_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PACER_USERNAME
+        sync: false
+      - key: PACER_PASSWORD
+        sync: false
+      - key: PACER_CLIENT_CODE
+        sync: false
+      - key: PACER_LOGIN_URL
+        sync: false
+      - key: PACER_USERNAME_FIELD
+        sync: false
+      - key: PACER_PASSWORD_FIELD
+        sync: false
+      - key: PACER_CLIENT_CODE_FIELD
+        sync: false
+      - key: PACER_OTP_FIELD
+        sync: false
+      - key: PACER_AUTH_COOKIE
+        sync: false
+      - key: PACER_AUTO_ACCEPT_FEES
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DASHBOARD_PASSWORD
+        sync: false
+
+  - type: cron
+    name: pacer-deadlines-sync
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm run sync
+    schedule: "0 * * * *"
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pacer-deadlines-db
+          property: connectionString
+      - key: APP_BASE_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PACER_USERNAME
+        sync: false
+      - key: PACER_PASSWORD
+        sync: false
+      - key: PACER_CLIENT_CODE
+        sync: false
+      - key: PACER_LOGIN_URL
+        sync: false
+      - key: PACER_USERNAME_FIELD
+        sync: false
+      - key: PACER_PASSWORD_FIELD
+        sync: false
+      - key: PACER_CLIENT_CODE_FIELD
+        sync: false
+      - key: PACER_OTP_FIELD
+        sync: false
+      - key: PACER_AUTH_COOKIE
+        sync: false
+      - key: PACER_AUTO_ACCEPT_FEES
+        sync: false
+      - key: CRON_SECRET
+        generateValue: true
+      - key: SESSION_SECRET
+        generateValue: true
+
+databases:
+  - name: pacer-deadlines-db
+    plan: basic-256mb

@@ -63,8 +63,8 @@ export async function syncMailbox(mailbox) {
     const documentStats = await pool.query(`
       select
         count(*) as total_documents,
-        count(*) filter (where read_status = 'read') as analyzed_documents,
-        count(*) filter (where read_status like 'download_error:%' or read_status = 'notice_read_pdf_blocked') as pending_documents
+        count(*) filter (where read_status = 'read' or read_status = 'notice_details_read_pdf_blocked') as analyzed_documents,
+        count(*) filter (where read_status like 'download_error:%' or read_status in ('notice_read_pdf_blocked', 'notice_details_read_pdf_blocked')) as pending_documents
       from documents
     `);
 
@@ -334,6 +334,7 @@ async function repairHtmlLinkedDocuments() {
         or read_status like 'read_error:%'
         or read_status like 'download_error:%'
         or read_status = 'notice_read_pdf_blocked'
+        or read_status = 'notice_details_read_pdf_blocked'
       )
     order by updated_at asc nulls first, created_at asc
     limit 1000
@@ -456,7 +457,7 @@ async function backfillBlockedDocumentSummaries() {
     select doc.id, doc.filename, doc.source_url, e.body_text
     from documents doc
     left join emails e on e.gmail_id = doc.gmail_id
-    where (doc.read_status like 'download_error:%' or doc.read_status = 'notice_read_pdf_blocked')
+    where (doc.read_status like 'download_error:%' or doc.read_status in ('notice_read_pdf_blocked', 'notice_details_read_pdf_blocked'))
       and (
         doc.document_summary is null
         or doc.document_summary like 'PACER did not release the PDF%'
@@ -471,7 +472,7 @@ async function backfillBlockedDocumentSummaries() {
     const summary = summarizeLinkedDocumentNotice(context);
     if (!summary) continue;
     await pool.query(
-      "update documents set document_type = 'PACER PDF pending', document_summary = $1, extracted_text = coalesce(extracted_text, $1), read_status = 'notice_read_pdf_blocked', updated_at = now() where id = $2",
+      "update documents set document_type = 'Court email details', document_summary = $1, extracted_text = coalesce(extracted_text, $1), read_status = 'notice_details_read_pdf_blocked', updated_at = now() where id = $2",
       [summary, row.id]
     );
   }
@@ -489,6 +490,7 @@ async function backfillDeadlinesFromReadDocuments() {
       and length(doc.extracted_text) >= 40
       and (
         doc.read_status = 'read'
+        or doc.read_status = 'notice_details_read_pdf_blocked'
         or doc.read_status like 'read:%'
       )
     order by coalesce(doc.updated_at, doc.created_at) desc
@@ -574,8 +576,14 @@ export async function refreshDocumentFromSource(documentId) {
   });
   const extracted = await readDocumentText(downloaded);
   const fallbackSummary = summarizeLinkedDocumentNotice(contextForBlockedLink(row.body_text, row.source_url, row.filename));
-  const status = linkedDocumentStatus(downloaded.status, extracted.status, fallbackSummary);
-  const analysis = await analyzeSavedDocument(downloaded.filename, downloaded.mimeType, { ...extracted, status }, fallbackSummary);
+  const fallbackText = blockedPdfFallbackText(row.body_text, row.source_url, row.filename, downloaded.status);
+  const status = blockedPdfReadableStatus(downloaded.status, extracted.status, fallbackText);
+  const analysis = await analyzeSavedDocument(
+    downloaded.filename,
+    downloaded.mimeType,
+    { text: status === "read" ? extracted.text : fallbackText, status },
+    fallbackSummary
+  );
   const updated = await pool.query(
     `update documents
      set filename = $1,
@@ -586,8 +594,8 @@ export async function refreshDocumentFromSource(documentId) {
          read_status = $6,
          document_type = $7,
          document_summary = $8,
-         review_status = case when $6 = 'read' then 'open' else review_status end,
-         archived_at = case when $6 = 'read' then null else archived_at end,
+         review_status = case when $6 in ('read', 'notice_details_read_pdf_blocked') then 'open' else review_status end,
+         archived_at = case when $6 in ('read', 'notice_details_read_pdf_blocked') then null else archived_at end,
          updated_at = now()
      where id = $9
      returning filename, mime_type, content, read_status, document_type, document_summary`,
@@ -596,7 +604,7 @@ export async function refreshDocumentFromSource(documentId) {
       downloaded.mimeType,
       downloaded.size,
       downloaded.content,
-      status === "read" ? extracted.text : fallbackSummary,
+      status === "read" ? extracted.text : fallbackText,
       status,
       analysis.documentType,
       analysis.summary,
@@ -609,10 +617,13 @@ export async function refreshDocumentFromSource(documentId) {
 async function analyzeSavedDocument(filename, mimeType, extracted, fallbackSummary = null) {
   const readStatus = String(extracted.status || "");
   if (!extracted.text || readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:") || readStatus.startsWith("read_error:") || readStatus === "stored_unreadable") {
+    const downloadReason = readStatus.startsWith("download_error:")
+      ? readStatus.replace(/^download_error:\s*/i, "").trim()
+      : "";
     return {
       documentType: readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:") ? "PACER PDF pending" : "Manual review required",
       summary: readStatus === "notice_read_pdf_blocked" || readStatus.startsWith("download_error:")
-        ? (fallbackSummary || "PACER has not released the PDF to the server yet. The dashboard will retry this link automatically during hourly sync and when Retry PACER Fetch is clicked.")
+        ? [downloadReason ? `PACER response: ${downloadReason}.` : "", fallbackSummary || "The dashboard will retry this link automatically during hourly sync and when Retry PACER Fetch is clicked."].filter(Boolean).join(" ")
         : "The document was saved, but the text could not be read clearly. Open it manually and verify any deadlines or hearing dates."
     };
   }
@@ -621,6 +632,38 @@ async function analyzeSavedDocument(filename, mimeType, extracted, fallbackSumma
     mimeType,
     text: extracted.text
   });
+}
+
+function blockedPdfFallbackText(bodyText, sourceUrl, filename, downloadStatus = "") {
+  const context = contextForBlockedLink(bodyText, sourceUrl, filename);
+  const summary = summarizeLinkedDocumentNotice(context);
+  const reason = String(downloadStatus || "").startsWith("download_error:")
+    ? String(downloadStatus).replace(/^download_error:\s*/i, "").trim()
+    : "";
+  return [
+    "The PDF itself is not saved yet, but the court email contained these document details.",
+    reason ? `PACER/PDF blocker: ${reason}.` : "",
+    summary || "",
+    "--- COURT EMAIL DOCUMENT DETAILS ---",
+    cleanBlockedDocumentContext(context)
+  ].filter(Boolean).join("\n").slice(0, 12000);
+}
+
+function blockedPdfReadableStatus(downloadStatus, extractedStatus, fallbackText) {
+  if (downloadStatus === "downloaded") return extractedStatus;
+  return fallbackText ? "notice_details_read_pdf_blocked" : linkedDocumentStatus(downloadStatus, extractedStatus, null);
+}
+
+function cleanBlockedDocumentContext(context) {
+  return String(context || "")
+    .replace(/https?:\/\/\S+/gi, "[ECF link]")
+    .replace(/\*\*\*NOTE TO PUBLIC ACCESS USERS\*\*\*[^]*?(?=U\.S\.|United States|Notice of Electronic Filing|Case Name:|Document Number:|Docket Text:|$)/i, "")
+    .replace(/Copy the URL address[^]*?(?=Docket Text:|Document description:|The following document|$)/gi, "")
+    .replace(/Electronic document Stamp:\s*\[[^\]]+\]/gi, "")
+    .replace(/Notice will be electronically mailed to:[^]*$/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function backfillMissingDocuments(gmail) {
@@ -736,11 +779,12 @@ async function saveDocuments(caseId, email) {
     const downloaded = await downloadLinkedDocument(linkedDocument);
     const extracted = await readDocumentText(downloaded);
     const fallbackSummary = summarizeLinkedDocumentNotice(linkedDocument.context);
-    const status = linkedDocumentStatus(downloaded.status, extracted.status, fallbackSummary);
+    const fallbackText = blockedPdfFallbackText(linkedDocument.context, linkedDocument.url, linkedDocument.filename, downloaded.status);
+    const status = blockedPdfReadableStatus(downloaded.status, extracted.status, fallbackText);
     const analysis = await analyzeSavedDocument(
       downloaded.filename,
       downloaded.mimeType,
-      { ...extracted, status },
+      { text: status === "read" ? extracted.text : fallbackText, status },
       fallbackSummary
     );
     const result = await pool.query(
@@ -757,7 +801,7 @@ async function saveDocuments(caseId, email) {
         downloaded.size,
         linkedDocument.url,
         downloaded.content,
-        status === "read" ? extracted.text : fallbackSummary,
+        status === "read" ? extracted.text : fallbackText,
         status,
         analysis.documentType,
         analysis.summary
@@ -822,7 +866,7 @@ function cleanCourtSnippet(value) {
 
 function linkedDocumentStatus(downloadStatus, readStatus, fallbackSummary) {
   if (downloadStatus === "downloaded") return readStatus;
-  return fallbackSummary ? "notice_read_pdf_blocked" : downloadStatus;
+  return downloadStatus || (fallbackSummary ? "notice_read_pdf_blocked" : "download_error: PACER did not return a readable document");
 }
 
 function firstContextMatch(text, pattern) {
@@ -857,7 +901,7 @@ async function downloadLinkedDocument(linkedDocument) {
 }
 
 async function fetchDocumentUrl(url, fallbackFilename, depth, options = {}) {
-  if (!options.authenticated && depth === 0 && hasPacerCredentials()) {
+  if (!options.authenticated && depth === 0) {
     const authenticated = await fetchDocumentUrlWithPacerAuth(url, fallbackFilename);
     if (authenticated) return authenticated;
   }
@@ -913,10 +957,6 @@ async function fetchDocumentUrl(url, fallbackFilename, depth, options = {}) {
     content,
     status: "downloaded"
   };
-}
-
-function hasPacerCredentials() {
-  return Boolean(config.pacerAuthCookie || (config.pacerUsername && config.pacerPassword));
 }
 
 async function fetchDocumentUrlWithPacerAuth(url, fallbackFilename) {
